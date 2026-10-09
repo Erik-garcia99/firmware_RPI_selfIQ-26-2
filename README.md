@@ -2,6 +2,19 @@
 
 ## Provisioning inicial
 
+### Instalación para producto terminado
+
+Durante la preparación de la imagen de Raspberry Pi, copiar este proyecto a la
+tarjeta y ejecutar una sola vez:
+
+```bash
+sudo ./install.sh
+```
+
+El instalador habilita `systemd`, `hostapd`, `dnsmasq` y `selfiq-rpi`. Después
+de eso, el usuario final únicamente conecta la Raspberry a la energía: todos
+los servicios arrancan automáticamente con el sistema, sin SSH ni comandos.
+
 La primera funcionalidad está en `src/selfiq_rpi`: una página FastAPI para capturar WiFi normal o empresarial y un servidor TCP en `192.158.50.1:5000` que responde a `AB CD 02 01 00` con las credenciales en campos TLV (`0x69` SSID, `0x70` contraseña, `0x75` usuario). Las credenciales se guardan atómicamente en `/var/lib/selfiq/credentials.json`.
 
 Instalar en la RPI:

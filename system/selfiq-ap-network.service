@@ -5,7 +5,7 @@ After=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/selfiq-rpi/system/selfiq-ap-network.sh
+ExecStart=/opt/selfiq-rpi/system-selfiq-ap-network.sh
 RemainAfterExit=yes
 
 [Install]
