@@ -1,0 +1,15 @@
+[Unit]
+Description=SelfIQ Raspberry Pi provisioning gateway
+After=network.target hostapd.service dnsmasq.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/selfiq-rpi
+Environment=SELFIQ_STATE_FILE=/var/lib/selfiq/credentials.json
+Environment=PYTHONPATH=/opt/selfiq-rpi/src
+ExecStart=/usr/bin/python3 -m selfiq_rpi.main
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
