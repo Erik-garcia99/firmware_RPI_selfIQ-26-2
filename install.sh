@@ -20,6 +20,8 @@ cp -a "$ROOT_DIR/src" "$INSTALL_DIR/"
 cp "$ROOT_DIR/requirements.txt" "$INSTALL_DIR/"
 install -m 0644 "$ROOT_DIR/system/hostapd.conf" /etc/hostapd/hostapd.conf
 install -m 0644 "$ROOT_DIR/system/dnsmasq.conf" /etc/dnsmasq.conf
+mkdir -p /etc/NetworkManager/conf.d
+install -m 0644 "$ROOT_DIR/system/10-selfiq-ap.conf" /etc/NetworkManager/conf.d/10-selfiq-ap.conf
 install -m 0755 "$ROOT_DIR/system/selfiq-ap-network.sh" "$INSTALL_DIR/system-selfiq-ap-network.sh"
 install -m 0644 "$ROOT_DIR/system/selfiq-ap-network.service" /etc/systemd/system/
 install -m 0644 "$ROOT_DIR/system/selfiq-rpi.service" /etc/systemd/system/
@@ -29,6 +31,7 @@ systemctl unmask hostapd || true
 systemctl unmask dnsmasq || true
 systemctl daemon-reload
 systemctl enable selfiq-ap-network.service hostapd.service dnsmasq.service selfiq-rpi.service
+systemctl restart NetworkManager.service || true
 systemctl restart selfiq-ap-network.service
 systemctl restart hostapd.service dnsmasq.service selfiq-rpi.service
 

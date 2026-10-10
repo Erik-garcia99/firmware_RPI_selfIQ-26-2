@@ -19,6 +19,13 @@ class NetworkManager:
             return False
         ssid = credentials["ssid"]
         password = credentials["password"]
+        # hostapd controla wlan0 durante el AP. Al recibir credenciales,
+        # devolvemos el control a NetworkManager para levantar la STA.
+        managed = await asyncio.create_subprocess_exec(
+            "nmcli", "device", "set", self.interface, "managed", "yes",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await managed.wait()
         command = ["nmcli", "device", "wifi", "connect", ssid, "password", password, "ifname", self.interface]
         if credentials.get("type") == "enterprise":
             command += ["802-1x.identity", credentials["username"]]
