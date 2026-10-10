@@ -1,9 +1,0 @@
-[project]
-name = "selfiq-rpi-gateway"
-version = "0.1.0"
-description = "Provisioning AP and TCP WiFi credential gateway for SelfIQ"
-requires-python = ">=3.10"
-dependencies = ["fastapi>=0.110,<1", "uvicorn[standard]>=0.29,<1", "python-multipart>=0.0.9,<1"]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]

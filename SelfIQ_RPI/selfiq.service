@@ -1,0 +1,23 @@
+[Unit]
+Description=SelfIQ Wi-Fi provisioning and TCP gateway
+After=NetworkManager.service
+Requires=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/selfiq
+ExecStart=/opt/selfiq/.venv/bin/python -m selfiq.app --config /etc/selfiq/config.json
+Restart=always
+RestartSec=10
+UMask=0077
+RuntimeDirectory=selfiq
+RuntimeDirectoryMode=0700
+StateDirectory=selfiq
+StateDirectoryMode=0700
+TimeoutStopSec=120
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

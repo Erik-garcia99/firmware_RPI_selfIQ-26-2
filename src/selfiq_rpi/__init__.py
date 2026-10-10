@@ -1,1 +1,0 @@
-"""SelfIQ Raspberry Pi gateway."""

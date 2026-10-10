@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $EUID -ne 0 ]]; then echo 'Ejecute: sudo bash install.sh'; exit 1; fi
+task_source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+sta_iface="${STA_IFACE:-wlan0}"
+ap_iface="${AP_IFACE:-uap0}"
+virtual_ap="${VIRTUAL_AP:-true}"
+wifi_country="${WIFI_COUNTRY:-MX}"
+if [[ "$virtual_ap" != true && "$virtual_ap" != false ]]; then echo 'VIRTUAL_AP debe ser true o false'; exit 1; fi
+if [[ "$sta_iface" == "$ap_iface" ]]; then echo 'STA y AP requieren interfaces distintas'; exit 1; fi
+if [[ ! "$sta_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$ap_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$wifi_country" =~ ^[A-Z]{2}$ ]]; then echo 'Interfaz o país inválidos'; exit 1; fi
+echo 'Instalando SelfIQ. El inicio del servicio puede cambiar la conexión Wi-Fi de esta Raspberry.'
+apt-get update
+apt-get install -y python3-venv network-manager iw hostapd dnsmasq iproute2 rfkill curl ca-certificates
+# SelfIQ launches its own isolated hostapd/dnsmasq processes; avoid double listeners.
+systemctl disable --now hostapd.service dnsmasq.service
+systemctl unmask hostapd.service
+systemctl enable --now NetworkManager.service
+rfkill unblock wifi
+iw reg set "$wifi_country"
+install -d -m 755 /opt/selfiq
+install -d -m 700 /etc/selfiq /var/lib/selfiq
+cp -r "$task_source_dir/selfiq" /opt/selfiq/
+install -m 644 "$task_source_dir/requirements.txt" /opt/selfiq/requirements.txt
+python3 -m venv /opt/selfiq/.venv
+/opt/selfiq/.venv/bin/pip install -r /opt/selfiq/requirements.txt
+if [[ ! -f /etc/selfiq/config.json ]]; then
+  STA_IFACE="$sta_iface" AP_IFACE="$ap_iface" VIRTUAL_AP="$virtual_ap" WIFI_COUNTRY="$wifi_country" /opt/selfiq/.venv/bin/python - <<'PY'
+import os, secrets, sys
+sys.path.insert(0, '/opt/selfiq')
+from selfiq.models import Config, atomic_json
+from dataclasses import asdict
+c = Config(sta_interface=os.environ['STA_IFACE'], ap_interface=os.environ['AP_IFACE'],
+           virtual_ap=os.environ['VIRTUAL_AP']=='true', country=os.environ['WIFI_COUNTRY'],
+           admin_token=secrets.token_urlsafe(32))
+atomic_json('/etc/selfiq/config.json', asdict(c))
+PY
+fi
+# Config is authoritative on reinstallation; do not silently alter interface mapping/token.
+configured_ap="$(/opt/selfiq/.venv/bin/python -c 'import json; print(json.load(open("/etc/selfiq/config.json"))["ap_interface"])')"
+if [[ ! "$configured_ap" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then echo 'Interfaz inválida en config.json'; exit 1; fi
+install -d /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/90-selfiq-ap.conf <<EOF
+[keyfile]
+unmanaged-devices=interface-name:$configured_ap
+EOF
+nmcli general reload
+install -m 644 "$task_source_dir/selfiq.service" /etc/systemd/system/selfiq.service
+systemctl daemon-reload
+systemctl enable --now selfiq.service
+echo 'Instalado. Estado: sudo systemctl status selfiq --no-pager'
+echo 'Página: conecte el teléfono a SelfIQ-Admi y abra http://192.168.50.1'

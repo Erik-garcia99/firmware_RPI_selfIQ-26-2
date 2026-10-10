@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configurar SelfIQ</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#eef6fb;color:#172b3c;margin:0;padding:24px}main{max-width:480px;margin:5vh auto;background:white;border-radius:22px;padding:28px;box-shadow:0 12px 40px #172b3c15}h1{margin:0;color:#245a7b}label{display:block;margin-top:18px;font-weight:600}input,select,button{box-sizing:border-box;width:100%;padding:13px;border:1px solid #b5c8d4;border-radius:10px;font:inherit}button{margin-top:24px;background:#7BBDE8;color:#172b3c;border:0;font-weight:700;cursor:pointer}p{line-height:1.5}#status{background:#eef6fb;border-radius:12px;padding:16px;white-space:pre-line}small{color:#506779}
+</style><main><h1>SelfIQ</h1><p>Conecta tu dispositivo al Wi-Fi de tu tienda.</p>
+<form id="form"><label>Tipo de red</label><select id="kind"><option value="1">Wi-Fi normal · WPA2 Personal</option><option value="2">Empresa · PEAP/MSCHAPv2</option></select>
+<label>Nombre de red (SSID)</label><input id="ssid" required autocomplete="off" maxlength="32">
+<div id="enterprise" hidden><label>Usuario</label><input id="username" autocomplete="username" maxlength="31"><p><small>La CA y el dominio de autenticación deben estar configurados por el instalador.</small></p></div>
+<label>Contraseña de la red</label><input id="password" type="password" required autocomplete="new-password" maxlength="64">
+<button id="submit">Conectar y comprobar</button></form>
+<p id="status" role="status">Cargando estado…</p><small>Durante la comprobación el Wi-Fi de configuración puede desconectarse. Vuelve a SelfIQ-Admi y abre http://__AP_IP__. No necesitas Internet para esta página.</small></main>
+<script>
+const session='__SESSION__'; const el=id=>document.getElementById(id);
+el('kind').onchange=()=>{el('enterprise').hidden=el('kind').value!=='2';el('username').required=el('kind').value==='2'};
+async function status(){try{const r=await fetch('/status');if(!r.ok)throw Error();const s=await r.json();el('status').textContent=(s.estado==='conectado'?'Raspberry conectada a '+s.ssid:s.estado==='conectando'?'Comprobando Wi-Fi…':'Esperando configuración.')+(s.error?'\n'+s.error:'')+(s.segundos_para_cierre!==null?'\nAP se cerrará en '+s.segundos_para_cierre+' s sin solicitudes de ESP32.':'');el('submit').disabled=s.estado==='conectando'}catch{el('status').textContent='Reconéctate a SelfIQ-Admi y recarga esta página para ver el resultado.'}}
+el('form').onsubmit=async e=>{e.preventDefault();el('submit').disabled=true;try{const r=await fetch('/configure',{method:'POST',headers:{'Content-Type':'application/json','X-SelfIQ-Session':session},body:JSON.stringify({kind:Number(el('kind').value),ssid:el('ssid').value,password:el('password').value,username:el('kind').value==='2'?el('username').value:''})});const s=await r.json();el('status').textContent=s.mensaje||s.detail;if(r.ok)el('password').value=''}catch{el('status').textContent='La conexión cambió. Reconéctate al AP y recarga.'}finally{el('submit').disabled=false}};
+status();setInterval(status,4000);
+</script></html>
