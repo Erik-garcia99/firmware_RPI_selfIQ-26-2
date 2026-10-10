@@ -12,11 +12,17 @@ class CredentialTcpServer:
         self.idle_seconds, self.on_idle = idle_seconds, on_idle
         self.server = None
         self.last_request = time.monotonic()
+        self.idle_enabled = False
         self._idle_task = None
 
     async def start(self):
         self.server = await asyncio.start_server(self._client, self.host, self.port)
         self._idle_task = asyncio.create_task(self._watch_idle())
+
+    def enable_idle_shutdown(self):
+        """Arm the AP shutdown only after WiFi setup succeeded."""
+        self.last_request = time.monotonic()
+        self.idle_enabled = True
 
     async def close(self):
         if self._idle_task:
@@ -53,6 +59,6 @@ class CredentialTcpServer:
     async def _watch_idle(self):
         while True:
             await asyncio.sleep(5)
-            if time.monotonic() - self.last_request >= self.idle_seconds:
+            if self.idle_enabled and time.monotonic() - self.last_request >= self.idle_seconds:
                 await self.on_idle()
                 return

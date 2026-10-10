@@ -18,16 +18,21 @@ async def run():
     # sigue disponible para que el usuario pueda corregirla desde la web.
     saved = store.load()
     if saved:
-        await network.connect(saved)
+        connected = await network.connect(saved)
 
     async def stop_setup():
         await tcp.close()
         await network.stop_setup_ap()
 
-    tcp = CredentialTcpServer(store, settings.ap_ip, settings.tcp_port, settings.ap_idle_seconds, stop_setup)
+    async def credentials_saved():
+        tcp.enable_idle_shutdown()
+
+    # Escuchar en todas las interfaces evita una carrera de arranque: hostapd
+    # puede tardar unos segundos en asignar la IP del AP a wlan0.
+    tcp = CredentialTcpServer(store, "0.0.0.0", settings.tcp_port, settings.ap_idle_seconds, stop_setup)
     await tcp.start()
     import uvicorn
-    config = uvicorn.Config(create_app(store, network, lambda: asyncio.sleep(0)), host=settings.http_host, port=settings.http_port, log_level="info")
+    config = uvicorn.Config(create_app(store, network, credentials_saved), host=settings.http_host, port=settings.http_port, log_level="info")
     await uvicorn.Server(config).serve()
 
 
