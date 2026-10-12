@@ -7,6 +7,7 @@ import random
 from urllib.parse import quote
 
 from websockets.asyncio.client import connect
+from .gateway_identity import GatewayIdentity, validate_backend
 
 log = logging.getLogger('selfiq.backend')
 
@@ -16,6 +17,11 @@ class BackendLink:
         self.config, self.execute = config, execute
         self.connected = False
         self.results = OrderedDict()
+        self.identity = None
+        self.registration_status = 'not_configured'
+        self.branch_id = None
+        self.changed = asyncio.Event()
+        self.socket = None
 
     async def process(self, raw):
         try:
@@ -55,27 +61,87 @@ class BackendLink:
             self.results.popitem(last=False)
         return response
 
+    def ensure_identity(self):
+        if self.identity is None:
+            self.identity = GatewayIdentity(self.config)
+        return self.identity
+
+    async def configure(self, url, token):
+        validate_backend(url, token)
+        identity = self.ensure_identity()
+        await asyncio.to_thread(identity.save, url, token)
+        self.registration_status = 'connecting'
+        self.changed.set()
+        if self.socket is not None:
+            await self.socket.close(code=1012)
+
     async def run(self):
-        if not self.config.backend_ws_url:
-            return
-        url = self.config.backend_ws_url.rstrip('/') + '/' + quote(self.config.gateway_id, safe='')
+        identity = self.ensure_identity()
         delay = 1
         while True:
+            self.changed.clear()
+            if not self.config.backend_ws_url or not self.config.gateway_token:
+                self.registration_status = 'not_configured'
+                await self.changed.wait()
+                continue
+            url = self.config.backend_ws_url.rstrip('/') + '/' + quote(self.config.gateway_id, safe='')
             try:
-                async with connect(url, additional_headers={'Authorization': 'Bearer ' + self.config.gateway_token},
-                                   ping_interval=20, ping_timeout=20, close_timeout=5,
+                async with connect(url, ping_interval=20, ping_timeout=20, close_timeout=5,
                                    open_timeout=10, max_size=8192, max_queue=8) as ws:
-                    self.connected = True
+                    self.socket = ws
+                    challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                    if challenge.get('type') != 'challenge':
+                        raise ValueError('Protocolo de registro incompatible')
+                    await ws.send(json.dumps(identity.proof(challenge['nonce'])))
+                    auth = json.loads(await asyncio.wait_for(ws.recv(), 10))
+                    if auth.get('type') != 'auth_status':
+                        raise ValueError('Respuesta de registro incorrecta')
+                    self.registration_status = auth.get('status', 'registration_rejected')
+                    self.branch_id = auth.get('branch_id')
+                    self.connected = self.registration_status == 'registered'
                     delay = 1
-                    log.info('Conexión con backend establecida')
-                    async for raw in ws:
-                        await ws.send(json.dumps(await self.process(raw)))
+                    log.info('Registro backend: %s', self.registration_status)
+                    if self.registration_status not in ('registered', 'token_invalid'):
+                        await ws.wait_closed()
+                    else:
+                        async for raw in ws:
+                            message = json.loads(raw)
+                            if message.get('type') == 'auth_status':
+                                self.registration_status = message.get('status', 'backend_unavailable')
+                                self.connected = self.registration_status == 'registered'
+                                continue
+                            if message.get('type') == 'command' and message.get('command') == 'gateway.token':
+                                # Available only on the authenticated device-identity channel.
+                                try:
+                                    await asyncio.to_thread(identity.save, self.config.backend_ws_url, message.get('branch_token'))
+                                    response = {'type':'result','id':message.get('id'),'ok':True,
+                                                'data':{'token_saved':True}}
+                                except (ValueError, TypeError, OSError):
+                                    response = {'type':'result','id':message.get('id'),'ok':False,
+                                                'error':'No pudo guardarse el token'}
+                                await ws.send(json.dumps(response))
+                                if response['ok']:
+                                    self.registration_status = 'connecting'
+                                    self.changed.set()
+                                    await ws.close(code=1012)
+                                    break
+                            elif self.connected:
+                                await ws.send(json.dumps(await self.process(raw)))
+                            else:
+                                await ws.send(json.dumps({'type':'result','id':message.get('id'),'ok':False,
+                                                          'error':'Token inválido; solo permite corregir registro'}))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Do not log URLs, tokens, frames or Wi-Fi credentials.
+                if self.registration_status not in ('token_invalid', 'registration_rejected'):
+                    self.registration_status = 'backend_unavailable'
                 log.warning('Backend desconectado (%s); reintentando', type(exc).__name__)
             finally:
                 self.connected = False
-            await asyncio.sleep(delay + random.uniform(0, delay / 4))
+                self.socket = None
+            if not self.changed.is_set():
+                try:
+                    await asyncio.wait_for(self.changed.wait(), delay + random.uniform(0, delay / 4))
+                except asyncio.TimeoutError:
+                    pass
             delay = min(delay * 2, 30)

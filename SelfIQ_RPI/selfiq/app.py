@@ -171,7 +171,7 @@ def create_app(config, network=None):
             # No CORS. Block cross-site form/fetch submissions and DNS rebinding.
             if request.method != 'GET':
                 host = request.headers.get('host', '')
-                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable', '/admin/tcp/disable'):
+                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable', '/admin/tcp/disable', '/admin/backend/configure'):
                     raise HTTPException(403, 'Host no permitido')
                 origin = request.headers.get('origin')
                 if origin and origin != 'http://' + host:
@@ -194,7 +194,10 @@ def create_app(config, network=None):
 
     @app.get('/status')
     async def status():
-        return {**ctrl.status(), 'tcp_activo': tcp.server is not None, 'backend_conectado': backend.connected}
+        return {**ctrl.status(), 'tcp_activo': tcp.server is not None, 'backend_conectado': backend.connected,
+                'gateway_id': config.gateway_id, 'branch_id': backend.branch_id,
+                'registration_status': backend.registration_status,
+                'registration_alert': 'Corrija el token de sucursal' if backend.registration_status in ('token_invalid', 'registration_rejected') else None}
 
     @app.post('/configure', status_code=202)
     async def configure(request: Request):
@@ -224,6 +227,26 @@ def create_app(config, network=None):
             await tcp.reconcile()
         job(perform())
         return {'mensaje': 'Comprobando conexión. Si desaparece el AP, reconéctese a SelfIQ-Admi y recargue la página.'}
+
+    @app.post('/backend/configure')
+    @app.post('/admin/backend/configure')
+    async def configure_backend(request: Request):
+        if request.url.path.startswith('/admin/'):
+            admin(request)
+        elif not secrets.compare_digest(request.headers.get('x-selfiq-session', ''), session):
+            raise HTTPException(403, 'Recargue la página de configuración')
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > 2048:
+                raise HTTPException(413, 'Solicitud demasiado grande')
+        try:
+            import json
+            body = json.loads(raw)
+            await backend.configure(body['backend_ws_url'], body['branch_token'])
+        except (ValueError, TypeError, KeyError):
+            raise HTTPException(422, 'Revise URL del backend y token de sucursal') from None
+        return {'message':'Token guardado; comprobando registro sin cambiar Wi-Fi', 'gateway_id': config.gateway_id}
 
     @app.post('/admin/ap/enable', status_code=202)
     @app.post('/admin/tcp/enable', status_code=202)

@@ -68,6 +68,7 @@ class Config:
     backend_ws_url: str = ''
     gateway_id: str = ''
     gateway_token: str = ''
+    gateway_state_file: str = '/var/lib/selfiq/gateway.json'
 
     @classmethod
     def load(cls, path):
@@ -80,8 +81,9 @@ class Config:
             url = urlsplit(result.backend_ws_url)
             if url.scheme not in ('ws', 'wss') or not url.hostname or url.username or url.password or url.query or url.fragment:
                 raise ValueError('backend_ws_url requiere ws:// o wss:// sin credenciales ni query')
-            if not re_safe_id(result.gateway_id) or len(result.gateway_token) < 32 or any(c in result.gateway_token for c in '\r\n'):
-                raise ValueError('Configure gateway_id y gateway_token (mínimo 32 caracteres)')
+        if result.gateway_id and not re_safe_id(result.gateway_id):
+            raise ValueError('gateway_id incorrecto')
+        # Missing/invalid enrollment token must not stop Wi-Fi provisioning or the service.
         import ipaddress, re
         ip = ipaddress.ip_address(result.ap_ip)
         if ip.version != 4 or not ip.is_private or str(ip).split('.')[-1] != '1':

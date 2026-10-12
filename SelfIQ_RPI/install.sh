@@ -21,6 +21,8 @@ iw reg set "$wifi_country"
 install -d -m 755 /opt/selfiq
 install -d -m 700 /etc/selfiq /var/lib/selfiq
 cp -r "$task_source_dir/selfiq" /opt/selfiq/
+install -d -m 755 /opt/selfiq/tools
+install -m 644 "$task_source_dir/tools/configure_backend.py" /opt/selfiq/tools/configure_backend.py
 install -m 644 "$task_source_dir/requirements.txt" /opt/selfiq/requirements.txt
 python3 -m venv /opt/selfiq/.venv
 /opt/selfiq/.venv/bin/pip install -r /opt/selfiq/requirements.txt
