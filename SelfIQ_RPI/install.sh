@@ -47,6 +47,7 @@ EOF
 nmcli general reload
 install -m 644 "$task_source_dir/selfiq.service" /etc/systemd/system/selfiq.service
 systemctl daemon-reload
-systemctl enable --now selfiq.service
+systemctl enable selfiq.service
+systemctl restart selfiq.service
 echo 'Instalado. Estado: sudo systemctl status selfiq --no-pager'
 echo 'Página: conecte el teléfono a SelfIQ-Admi y abra http://192.168.50.1'

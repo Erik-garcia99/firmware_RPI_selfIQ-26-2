@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_TOKENS: '{"rpi-local-01":"${GATEWAY_TOKEN:?Define GATEWAY_TOKEN en dev/.env}"}'
+      DEV_API_TOKEN: ${DEV_API_TOKEN:?Define DEV_API_TOKEN en dev/.env}
+    restart: unless-stopped
+  rpi-simulator:
+    profiles: [simulation]
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile
+    command: ["python", "-m", "dev.simulate_rpi"]
+    environment:
+      SELFIQ_BACKEND_WS_URL: ws://backend:8000/ws/gateways
+      SELFIQ_GATEWAY_ID: rpi-local-01
+      SELFIQ_GATEWAY_TOKEN: ${GATEWAY_TOKEN:?Define GATEWAY_TOKEN en dev/.env}
+    ports:
+      - "8081:8081"
+      - "5000:5000"
+    depends_on: [backend]

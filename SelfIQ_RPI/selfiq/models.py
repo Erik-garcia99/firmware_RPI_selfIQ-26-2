@@ -65,10 +65,23 @@ class Config:
     state_file: str = '/var/lib/selfiq/credentials.json'
     runtime_dir: str = '/run/selfiq'
     tcp_port: int = 5000
+    backend_ws_url: str = ''
+    gateway_id: str = ''
+    gateway_token: str = ''
 
     @classmethod
     def load(cls, path):
         result = cls(**json.loads(Path(path).read_text()))
+        # Optional outbound backend link; existing installations remain compatible.
+        for field in ('backend_ws_url', 'gateway_id', 'gateway_token'):
+            setattr(result, field, os.environ.get('SELFIQ_' + field.upper(), getattr(result, field)))
+        if result.backend_ws_url:
+            from urllib.parse import urlsplit
+            url = urlsplit(result.backend_ws_url)
+            if url.scheme not in ('ws', 'wss') or not url.hostname or url.username or url.password or url.query or url.fragment:
+                raise ValueError('backend_ws_url requiere ws:// o wss:// sin credenciales ni query')
+            if not re_safe_id(result.gateway_id) or len(result.gateway_token) < 32 or any(c in result.gateway_token for c in '\r\n'):
+                raise ValueError('Configure gateway_id y gateway_token (mínimo 32 caracteres)')
         import ipaddress, re
         ip = ipaddress.ip_address(result.ap_ip)
         if ip.version != 4 or not ip.is_private or str(ip).split('.')[-1] != '1':
@@ -86,3 +99,7 @@ class Config:
         if len(result.admin_token) < 32:
             raise ValueError('Falta token administrativo de al menos 32 caracteres')
         return result
+
+def re_safe_id(value):
+    import re
+    return isinstance(value, str) and bool(re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', value))

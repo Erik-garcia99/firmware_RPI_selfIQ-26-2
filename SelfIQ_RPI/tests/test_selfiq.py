@@ -146,6 +146,33 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(self.ctrl.can_distribute())
         self.assertTrue(Path(self.c.state_file).exists())
 
+    def test_reopen_preserves_file_profile_and_sta_then_expires(self):
+        self.ctrl.configure(self.creds)
+        saved = Path(self.c.state_file).read_bytes()
+        profile = self.ctrl.profile
+        profiles = self.net.profiles.copy()
+        self.ctrl.stop_provisioning()
+        self.ctrl.reopen()
+        self.assertEqual(Path(self.c.state_file).read_bytes(), saved)
+        self.assertEqual(self.ctrl.profile, profile)
+        self.assertEqual(self.net.profiles, profiles)
+        self.assertEqual(self.net.current, profile)
+        self.assertFalse(self.ctrl.configuration_required())
+        self.now += 300
+        self.ctrl.tick()
+        self.assertFalse(self.net.ap_active)
+        self.assertTrue(self.ctrl.online)
+        self.assertEqual(Path(self.c.state_file).read_bytes(), saved)
+
+    def test_reopen_without_connected_saved_wifi_is_rejected(self):
+        self.ctrl.bootstrap()
+        with self.assertRaises(ValueError):
+            self.ctrl.reopen()
+        self.ctrl.configure(self.creds)
+        self.net.current = None
+        with self.assertRaises(ValueError):
+            self.ctrl.reopen()
+
 class ModelTests(unittest.TestCase):
     def test_byte_limits_and_injection(self):
         for c in (Credentials('á'*17, '12345678'), Credentials('bad\nssid', '12345678'), Credentials('Casa', 'short'), Credentials('S', 'P', 2, 'U'*32), Credentials('S', 'P', 3)):

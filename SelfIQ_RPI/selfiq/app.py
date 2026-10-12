@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from .models import Config, Credentials
 from .network import Network
 from .controller import Controller
+from .backend_link import BackendLink
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 
 log = logging.getLogger('selfiq')
@@ -21,7 +22,7 @@ class TCPService:
         self.clients = set()
 
     async def handle(self, reader, writer):
-        if len(self.clients) >= 8 or not self.ctrl.net.ap_healthy() or self.ctrl.busy:
+        if len(self.clients) >= 8 or not self.ctrl.ap_wanted or not self.ctrl.net.ap_healthy() or self.ctrl.busy:
             writer.close()
             await writer.wait_closed()
             return
@@ -30,10 +31,9 @@ class TCPService:
             # Idle clients do not keep provisioning alive.
             for _ in range(32):
                 frame = await read_frame(reader)
-                if frame.header == HEADER and frame.kind == 0 and frame.action == 1 and frame.data == b'\x00' and self.ctrl.can_distribute():
-                    payload = credentials_frame(self.ctrl.creds)
-                    self.ctrl.touch()
-                    self.ctrl.delivered += 1
+                if frame.header == HEADER and frame.kind == 0 and frame.action == 1 and frame.data == b'\x00':
+                    creds = self.ctrl.requested_credentials()
+                    payload = credentials_frame(creds) if creds else NACK
                 elif frame.header == ACK and frame.kind == 3 and frame.action == 0 and frame.data == b'\x01':
                     # Receipt acknowledgment, not proof ESP joined the final Wi-Fi.
                     break
@@ -58,7 +58,7 @@ class TCPService:
                 pass
 
     async def reconcile(self):
-        wanted = self.ctrl.net.ap_healthy() and not self.ctrl.busy
+        wanted = self.ctrl.ap_wanted and self.ctrl.net.ap_healthy() and not self.ctrl.busy
         if wanted and self.server is None:
             self.server = await asyncio.start_server(self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port)
         elif not wanted:
@@ -78,6 +78,34 @@ def create_app(config, network=None):
     ctrl = Controller(config, network or Network(config))
     tcp = TCPService(ctrl)
     jobs = set()
+
+    async def execute(command):
+        if command == 'status':
+            # Backend receives operational state, never SSID/password/username.
+            state = ctrl.status()
+            state.pop('ssid', None)
+            return {**state, 'tcp_activo': tcp.server is not None}
+        if ctrl.busy:
+            raise ValueError('Configuración en curso')
+        if not ctrl.online or not ctrl.creds:
+            raise ValueError('Wi-Fi no conectado; configure la Raspberry desde su AP')
+        ctrl.busy = True
+        try:
+            if command == 'tcp.enable':
+                await asyncio.to_thread(ctrl.reopen)
+            elif command == 'tcp.disable':
+                await tcp.close()
+                await asyncio.to_thread(ctrl.stop_provisioning)
+            else:
+                raise ValueError('Orden no permitida')
+        finally:
+            ctrl.busy = False
+        await tcp.reconcile()
+        if command == 'tcp.enable' and tcp.server is None:
+            raise ValueError('No se pudo iniciar TCP')
+        return await execute('status')
+
+    backend = BackendLink(config, execute)
 
     def job(coro):
         task = asyncio.create_task(coro)
@@ -100,11 +128,16 @@ def create_app(config, network=None):
         await asyncio.to_thread(ctrl.bootstrap)
         await tcp.reconcile()
         task = asyncio.create_task(monitor())
+        backend_task = asyncio.create_task(backend.run())
         try:
             yield
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            # Let a network mutation finish before cancelling the command reader.
+            if ctrl.busy:
+                await asyncio.gather(*tuple(jobs), return_exceptions=True)
+            backend_task.cancel()
+            await asyncio.gather(task, backend_task, return_exceptions=True)
             # Complete in-flight network mutations before shutting children down.
             if jobs:
                 await asyncio.gather(*tuple(jobs), return_exceptions=True)
@@ -114,6 +147,8 @@ def create_app(config, network=None):
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.controller = ctrl
     app.state.tcp = tcp
+    app.state.backend = backend
+    app.state.execute_command = execute
     session = secrets.token_urlsafe(32)
     ap_subnet = ipaddress.ip_network(config.ap_ip + '/24', strict=False)
 
@@ -136,7 +171,7 @@ def create_app(config, network=None):
             # No CORS. Block cross-site form/fetch submissions and DNS rebinding.
             if request.method != 'GET':
                 host = request.headers.get('host', '')
-                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path != '/admin/ap/enable':
+                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable', '/admin/tcp/disable'):
                     raise HTTPException(403, 'Host no permitido')
                 origin = request.headers.get('origin')
                 if origin and origin != 'http://' + host:
@@ -152,12 +187,14 @@ def create_app(config, network=None):
 
     @app.get('/', response_class=HTMLResponse)
     async def index():
+        if not ctrl.configuration_required():
+            raise HTTPException(409, 'Wi-Fi ya configurado; active TCP para agregar una ESP32')
         html = Path(__file__).with_name('index.html').read_text()
         return html.replace('__SESSION__', session).replace('__AP_IP__', config.ap_ip)
 
     @app.get('/status')
     async def status():
-        return ctrl.status()
+        return {**ctrl.status(), 'tcp_activo': tcp.server is not None, 'backend_conectado': backend.connected}
 
     @app.post('/configure', status_code=202)
     async def configure(request: Request):
@@ -165,6 +202,8 @@ def create_app(config, network=None):
             raise HTTPException(403, 'Recargue la página de configuración')
         if ctrl.busy:
             raise HTTPException(409, 'Ya se está comprobando una red')
+        if not ctrl.configuration_required():
+            raise HTTPException(409, 'Wi-Fi conectado; no es necesario cambiar sus credenciales')
         raw = bytearray()
         async for chunk in request.stream():
             raw.extend(chunk)
@@ -187,14 +226,19 @@ def create_app(config, network=None):
         return {'mensaje': 'Comprobando conexión. Si desaparece el AP, reconéctese a SelfIQ-Admi y recargue la página.'}
 
     @app.post('/admin/ap/enable', status_code=202)
+    @app.post('/admin/tcp/enable', status_code=202)
     async def reopen(request: Request):
         admin(request)
         if ctrl.busy:
             raise HTTPException(409, 'Configuración en curso')
+        if not ctrl.online or not ctrl.creds:
+            raise HTTPException(409, 'Wi-Fi no conectado; use la página de configuración del AP')
         ctrl.busy = True
         async def perform():
             try:
                 await asyncio.to_thread(ctrl.reopen)
+            except ValueError as exc:
+                ctrl.error = str(exc)
             except Exception:
                 ctrl.error = 'No pudo reabrirse AP; consulte logs'
                 log.exception('Fallo al reabrir AP')
@@ -202,7 +246,23 @@ def create_app(config, network=None):
                 ctrl.busy = False
             await tcp.reconcile()
         job(perform())
-        return {'mensaje': 'Solicitada apertura del AP'}
+        return {'mensaje': 'Solicitada apertura de AP + TCP con las credenciales Wi-Fi guardadas',
+                'inactividad_segundos': config.idle_seconds}
+
+    @app.post('/admin/tcp/disable')
+    async def stop_provisioning(request: Request):
+        admin(request)
+        if ctrl.busy:
+            raise HTTPException(409, 'Configuración en curso')
+        if not ctrl.online:
+            raise HTTPException(409, 'El AP debe permanecer disponible para configurar Wi-Fi')
+        ctrl.busy = True
+        try:
+            await tcp.close()
+            await asyncio.to_thread(ctrl.stop_provisioning)
+        finally:
+            ctrl.busy = False
+        return {'mensaje': 'TCP y AP cerrados; credenciales Wi-Fi conservadas'}
     return app
 
 def main():

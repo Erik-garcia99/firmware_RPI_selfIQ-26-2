@@ -5,6 +5,7 @@ Requires=NetworkManager.service
 StartLimitIntervalSec=0
 
 [Service]
+EnvironmentFile=-/etc/selfiq/backend.env
 Type=simple
 User=root
 WorkingDirectory=/opt/selfiq

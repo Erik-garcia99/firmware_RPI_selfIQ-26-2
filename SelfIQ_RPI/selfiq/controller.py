@@ -23,7 +23,8 @@ class Controller:
         self.delivered = 0
 
     def touch(self):
-        self.last_request = self.clock()
+        with self.lock:
+            self.last_request = self.clock()
 
     def bootstrap(self):
         with self.lock:
@@ -119,20 +120,41 @@ class Controller:
 
     def reopen(self):
         with self.lock:
+            if not self.creds or not self.online or not self.net.active(self.profile):
+                raise ValueError('Wi-Fi no conectado; use la página de configuración del AP')
+            # Reuse credentials in memory. Never rebuild a profile or write state here.
             self.ap_wanted = True
             self.touch()
             self.net.start_ap(self.online)
+            self.error = ''
+
+    def stop_provisioning(self):
+        with self.lock:
+            self.ap_wanted = False
+            self.net.stop_ap()
+
+    def configuration_required(self):
+        return not self.online
+
+    def requested_credentials(self):
+        with self.lock:
+            if not self.can_distribute():
+                return None
+            self.touch()
+            self.delivered += 1
+            return self.creds
 
     def shutdown(self):
         with self.lock:
             self.net.stop_ap()
 
     def can_distribute(self):
-        return bool(not self.busy and self.online and self.creds and self.net.ap_healthy())
+        return bool(not self.busy and self.ap_wanted and self.online and self.creds and self.net.ap_healthy())
 
     def status(self):
         return {'estado': 'conectando' if self.busy else ('conectado' if self.online else 'esperando_configuracion'),
                 'ap_activo': self.net.ap_healthy(), 'ssid': self.creds.ssid if self.creds else None,
+                'configuracion_requerida': self.configuration_required(),
                 'error': self.error, 'credenciales_entregadas': self.delivered,
                 'segundos_para_cierre': max(0, int(self.c.idle_seconds - (self.clock() - self.last_request)))
                     if self.online and self.net.ap_healthy() else None}
