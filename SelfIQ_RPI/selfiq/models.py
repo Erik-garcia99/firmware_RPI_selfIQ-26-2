@@ -74,8 +74,9 @@ class Config:
     def load(cls, path):
         result = cls(**json.loads(Path(path).read_text()))
         # Optional outbound backend link; existing installations remain compatible.
-        for field in ('backend_ws_url', 'gateway_id', 'gateway_token'):
+        for field in ('gateway_id', 'gateway_token'):
             setattr(result, field, os.environ.get('SELFIQ_' + field.upper(), getattr(result, field)))
+        result.backend_ws_url = os.environ.get('SELFIQ_BACKEND_WS_URL', '').strip().rstrip('/')
         if result.backend_ws_url:
             from urllib.parse import urlsplit
             url = urlsplit(result.backend_ws_url)

@@ -243,9 +243,11 @@ def create_app(config, network=None):
         try:
             import json
             body = json.loads(raw)
-            await backend.configure(body['backend_ws_url'], body['branch_token'])
+            if not config.backend_ws_url:
+                raise HTTPException(503, 'El equipo requiere configuración del servicio; contacte a soporte')
+            await backend.configure(config.backend_ws_url, body['branch_token'])
         except (ValueError, TypeError, KeyError):
-            raise HTTPException(422, 'Revise URL del backend y token de sucursal') from None
+            raise HTTPException(422, 'Revise el token de sucursal') from None
         return {'message':'Token guardado; comprobando registro sin cambiar Wi-Fi', 'gateway_id': config.gateway_id}
 
     @app.post('/admin/ap/enable', status_code=202)

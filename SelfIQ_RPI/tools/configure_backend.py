@@ -9,10 +9,9 @@ from pathlib import Path
 
 def main():
     config = json.loads(Path('/etc/selfiq/config.json').read_text())
-    url = input('URL backend (ws://IP_LAPTOP:8000/ws/gateways): ').strip()
     token = getpass.getpass('Token de sucursal: ').strip()
     request = urllib.request.Request('http://127.0.0.1/admin/backend/configure',
-        data=json.dumps({'backend_ws_url':url,'branch_token':token}).encode(),
+        data=json.dumps({'branch_token':token}).encode(),
         headers={'Content-Type':'application/json','X-SelfIQ-Token':config['admin_token']},method='POST')
     try:
         with urllib.request.urlopen(request, timeout=15) as response:

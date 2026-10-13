@@ -28,7 +28,7 @@ class GatewayIdentity:
             self.data = {'gateway_id': config.gateway_id or 'rpi-' + uuid4().hex,
                 'private_key': base64.b64encode(key.private_bytes(serialization.Encoding.Raw,
                     serialization.PrivateFormat.Raw, serialization.NoEncryption())).decode(),
-                'backend_ws_url': config.backend_ws_url, 'branch_token': config.gateway_token}
+                'branch_token': config.gateway_token}
             atomic_json(path, self.data)
         if not re_safe_id(self.data['gateway_id']):
             raise ValueError('Identidad guardada inválida; contacte a soporte')
@@ -37,12 +37,12 @@ class GatewayIdentity:
 
     def apply(self):
         self.config.gateway_id = self.data['gateway_id']
-        self.config.backend_ws_url = self.data['backend_ws_url']
         self.config.gateway_token = self.data['branch_token']
 
     def save(self, url, token):
         validate_backend(url, token)
-        data = {**self.data, 'backend_ws_url': url.rstrip('/'), 'branch_token': token}
+        data = {k:v for k,v in self.data.items() if k != 'backend_ws_url'}
+        data['branch_token'] = token
         atomic_json(self.config.gateway_state_file, data)
         self.data = data
         self.apply()
