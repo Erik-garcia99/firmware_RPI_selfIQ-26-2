@@ -3,16 +3,14 @@ import base64
 from pathlib import Path
 import json
 from uuid import uuid4
-from urllib.parse import urlsplit
+from .backend_config import websocket_url
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from .models import atomic_json, re_safe_id
 
 
 def validate_backend(url, token):
-    parsed = urlsplit(url)
-    if parsed.scheme not in ('ws', 'wss') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError('URL requiere ws:// o wss:// sin credenciales ni query')
+    websocket_url(url)
     if not isinstance(token, str) or not 32 <= len(token) <= 255 or any(c.isspace() for c in token):
         raise ValueError('Token de sucursal incorrecto')
 
@@ -46,6 +44,7 @@ class GatewayIdentity:
         atomic_json(self.config.gateway_state_file, data)
         self.data = data
         self.apply()
+        self.config.backend_ws_url = websocket_url(url)
 
     def proof(self, nonce):
         if not isinstance(nonce, str) or not 16 <= len(nonce) <= 128:

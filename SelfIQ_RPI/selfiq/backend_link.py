@@ -7,6 +7,7 @@ import random
 from urllib.parse import quote
 
 from websockets.asyncio.client import connect
+from .backend_config import websocket_url
 from .gateway_identity import GatewayIdentity, validate_backend
 
 log = logging.getLogger('selfiq.backend')
@@ -84,17 +85,19 @@ class BackendLink:
                 self.registration_status = 'not_configured'
                 await self.changed.wait()
                 continue
-            url = self.config.backend_ws_url.rstrip('/') + '/' + quote(self.config.gateway_id, safe='')
+            url = websocket_url(self.config.backend_ws_url) + '/' + quote(self.config.gateway_id, safe='')
             try:
+                log.info('Conectando gateway %s al backend %s', self.config.gateway_id,
+                         'por WSS/TLS' if url.startswith('wss://') else 'de desarrollo local')
                 async with connect(url, ping_interval=20, ping_timeout=20, close_timeout=5,
                                    open_timeout=10, max_size=8192, max_queue=8) as ws:
                     self.socket = ws
                     challenge = json.loads(await asyncio.wait_for(ws.recv(), 10))
-                    if challenge.get('type') != 'challenge':
+                    if not isinstance(challenge, dict) or challenge.get('type') != 'challenge':
                         raise ValueError('Protocolo de registro incompatible')
-                    await ws.send(json.dumps(identity.proof(challenge['nonce'])))
+                    await ws.send(json.dumps(identity.proof(challenge.get('nonce'))))
                     auth = json.loads(await asyncio.wait_for(ws.recv(), 10))
-                    if auth.get('type') != 'auth_status':
+                    if not isinstance(auth, dict) or auth.get('type') != 'auth_status':
                         raise ValueError('Respuesta de registro incorrecta')
                     self.registration_status = auth.get('status', 'registration_rejected')
                     self.branch_id = auth.get('branch_id')
@@ -106,6 +109,8 @@ class BackendLink:
                     else:
                         async for raw in ws:
                             message = json.loads(raw)
+                            if not isinstance(message, dict):
+                                raise ValueError('Mensaje backend incorrecto')
                             if message.get('type') == 'auth_status':
                                 self.registration_status = message.get('status', 'backend_unavailable')
                                 self.connected = self.registration_status == 'registered'

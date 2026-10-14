@@ -38,6 +38,10 @@ c = Config(sta_interface=os.environ['STA_IFACE'], ap_interface=os.environ['AP_IF
 atomic_json('/etc/selfiq/config.json', asdict(c))
 PY
 fi
+# Create configuration guidance once; never overwrite a deployed URL/token.
+if [[ ! -f /etc/selfiq/backend.env ]]; then
+  install -m 600 "$task_source_dir/config/backend.env.example" /etc/selfiq/backend.env
+fi
 # Config is authoritative on reinstallation; do not silently alter interface mapping/token.
 configured_ap="$(/opt/selfiq/.venv/bin/python -c 'import json; print(json.load(open("/etc/selfiq/config.json"))["ap_interface"])')"
 if [[ ! "$configured_ap" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then echo 'Interfaz inválida en config.json'; exit 1; fi
@@ -53,3 +57,5 @@ systemctl enable selfiq.service
 systemctl restart selfiq.service
 echo 'Instalado. Estado: sudo systemctl status selfiq --no-pager'
 echo 'Página: conecte el teléfono a SelfIQ-Admi y abra http://192.168.50.1'
+echo 'Backend Railway: edite sudo nano /etc/selfiq/backend.env y reinicie selfiq.'
+echo 'Token de sucursal: sudo /opt/selfiq/.venv/bin/python /opt/selfiq/tools/configure_backend.py'

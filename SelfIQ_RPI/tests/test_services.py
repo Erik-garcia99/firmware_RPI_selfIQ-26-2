@@ -1,4 +1,5 @@
 import asyncio
+import re
 from dataclasses import replace
 import unittest
 import tempfile
@@ -63,7 +64,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         app = create_app(replace(Config(), admin_token='T'*32), FakeNetwork())
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
             page = await client.get('/')
-            token = page.text.split("const session='")[1].split("'")[0]
+            token = re.search(r"const session\s*=\s*'([^']+)'", page.text).group(1)
             app.state.controller.online = True
             r = await client.post('/configure', headers={'X-SelfIQ-Session': token},
                                   json={'ssid': 'Otro', 'password': 'abcdefgh'})
@@ -78,7 +79,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 200)
             self.assertIn('192.168.50.1', r.text)
             self.assertEqual(r.headers['cache-control'], 'no-store')
-            token = r.text.split("const session='")[1].split("'")[0]
+            token = re.search(r"const session\s*=\s*'([^']+)'", r.text).group(1)
             self.assertEqual((await client.get('/status')).json()['estado'], 'esperando_configuracion')
             r = await client.post('/configure', json={'ssid': 'Casa', 'password': '12345678'})
             self.assertEqual(r.status_code, 403)

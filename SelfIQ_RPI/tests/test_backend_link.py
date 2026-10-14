@@ -1,179 +1,178 @@
 import asyncio
-from contextlib import asynccontextmanager
+import re
 from dataclasses import replace
-import json
-import os
-from pathlib import Path
-import socket
-import tempfile
 import unittest
-from unittest.mock import patch
-
+import tempfile
+from pathlib import Path
 import httpx
-import uvicorn
-from websockets.asyncio.client import connect
-from websockets.exceptions import InvalidStatus
-from dev.backend import create_app as create_backend
-from selfiq.app import create_app
-from selfiq.backend_link import BackendLink
-from selfiq.models import Config, Credentials, atomic_json
-from selfiq.protocol import HEADER, encode, read_frame, credentials_frame
+from selfiq.app import create_app, TCPService
+from selfiq.models import Config, Credentials
+from selfiq.controller import Controller
+from selfiq.protocol import *
 from test_selfiq import FakeNetwork
 
+class HTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_reopen_reuses_credentials_without_web_and_closes_sockets(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = replace(Config(), state_file=d + '/credentials.json', admin_token='T'*32,
+                        ap_ip='127.0.0.1', tcp_port=0)
+            net = FakeNetwork()
+            app = create_app(c, net)
+            ctrl, tcp = app.state.controller, app.state.tcp
+            ctrl.configure(Credentials('Local', '12345678'))
+            original = Path(c.state_file).read_bytes()
+            ctrl.stop_provisioning()
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=('10.1.1.20', 100)),
+                                       base_url='http://10.1.1.1')
+            headers = {'X-SelfIQ-Token': c.admin_token}
+            try:
+                self.assertEqual((await client.post('/admin/tcp/enable')).status_code, 403)
+                response = await client.post('/admin/tcp/enable', headers=headers)
+                self.assertEqual(response.status_code, 202)
+                for _ in range(100):
+                    if not ctrl.busy and tcp.server is not None:
+                        break
+                    await asyncio.sleep(.01)
+                self.assertIsNotNone(tcp.server)
+                state = (await client.get('/status', headers=headers)).json()
+                self.assertTrue(state['tcp_activo'])
+                self.assertFalse(state['configuracion_requerida'])
+                self.assertEqual((await client.get('/', headers=headers)).status_code, 409)
+                reader, writer = await asyncio.open_connection('127.0.0.1', tcp.server.sockets[0].getsockname()[1])
+                writer.write(encode(HEADER, 0, 1, b'\x00'))
+                await writer.drain()
+                self.assertEqual((await read_frame(reader)).data, credentials_frame(ctrl.creds)[4:])
+                self.assertEqual(Path(c.state_file).read_bytes(), original)
+                self.assertEqual(net.current, ctrl.profile)
+                self.assertEqual((await client.post('/admin/tcp/disable', headers=headers)).status_code, 200)
+                self.assertEqual(await asyncio.wait_for(reader.read(), 1), b'')
+                writer.close()
+                await writer.wait_closed()
+                self.assertTrue(ctrl.online)
+                self.assertEqual(Path(c.state_file).read_bytes(), original)
+                # A genuine failure brings configuration back without erasing state.
+                net.current, net.accept = None, False
+                ctrl.tick()
+                self.assertEqual((await client.get('/', headers=headers)).status_code, 200)
+                self.assertEqual((await client.post('/admin/tcp/enable', headers=headers)).status_code, 409)
+                self.assertEqual(Path(c.state_file).read_bytes(), original)
+            finally:
+                await tcp.close()
+                await client.aclose()
 
-@asynccontextmanager
-async def serve(app):
-    sock = socket.socket()
-    sock.bind(('127.0.0.1', 0))
-    port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False))
-    task = asyncio.create_task(server.serve(sockets=[sock]))
-    try:
-        for _ in range(200):
-            if server.started:
-                break
-            if task.done():
-                await task
-                raise RuntimeError('Servidor no inició')
-            await asyncio.sleep(.01)
-        else:
-            raise RuntimeError('Timeout de inicio')
-        yield port
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, 5)
-        sock.close()
+    async def test_configuration_submission_blocked_while_wifi_connected(self):
+        app = create_app(replace(Config(), admin_token='T'*32), FakeNetwork())
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1') as client:
+            page = await client.get('/')
+            token = re.search(r"const session\s*=\s*'([^']+)'", page.text).group(1)
+            app.state.controller.online = True
+            r = await client.post('/configure', headers={'X-SelfIQ-Session': token},
+                                  json={'ssid': 'Otro', 'password': 'abcdefgh'})
+            self.assertEqual(r.status_code, 409)
 
+    async def test_http_page_status_invalid_input_and_csrf(self):
+        c = replace(Config(), admin_token='T'*32)
+        net = FakeNetwork()
+        app = create_app(c, net)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=('127.0.0.1', 100)), base_url='http://127.0.0.1') as client:
+            r = await client.get('/')
+            self.assertEqual(r.status_code, 200)
+            self.assertIn('192.168.50.1', r.text)
+            self.assertEqual(r.headers['cache-control'], 'no-store')
+            token = re.search(r"const session\s*=\s*'([^']+)'", r.text).group(1)
+            self.assertEqual((await client.get('/status')).json()['estado'], 'esperando_configuracion')
+            r = await client.post('/configure', json={'ssid': 'Casa', 'password': '12345678'})
+            self.assertEqual(r.status_code, 403)
+            r = await client.post('/configure', headers={'X-SelfIQ-Session': token}, json={'ssid':'Casa', 'password':'bad'})
+            self.assertEqual(r.status_code, 422)
+            r = await client.post('/configure', headers={'X-SelfIQ-Session': token, 'Origin':'http://malicious.example'}, json={})
+            self.assertEqual(r.status_code, 403)
+            r = await client.post('/configure', headers={'X-SelfIQ-Session':token}, content='A'*2049)
+            self.assertEqual(r.status_code, 413)
+            self.assertEqual((await client.post('/admin/ap/enable')).status_code, 403)
+            app.state.controller.busy = True
+            r = await client.post('/configure', headers={'X-SelfIQ-Session':token}, json={})
+            self.assertEqual(r.status_code, 409)
+    async def test_lan_access_restricted(self):
+        app = create_app(replace(Config(), admin_token='T'*32), FakeNetwork())
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=('10.1.1.20', 100)), base_url='http://10.1.1.1') as client:
+            self.assertEqual((await client.get('/')).status_code, 403)
+            self.assertEqual((await client.get('/status', headers={'X-SelfIQ-Token':'T'*32})).status_code, 200)
 
-class MessageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_duplicate_id_does_not_execute_twice_and_reuse_rejected(self):
-        calls = []
-        async def execute(command):
-            calls.append(command)
-            return {'tcp_activo': True}
-        link = BackendLink(Config(), execute)
-        message = json.dumps({'type': 'command', 'id': 'one', 'command': 'tcp.enable'})
-        first = await link.process(message)
-        self.assertTrue(first['ok'])
-        self.assertEqual(await link.process(message), first)
-        self.assertEqual(calls, ['tcp.enable'])
-        response = await link.process(json.dumps({'type': 'command', 'id': 'one', 'command': 'tcp.disable'}))
-        self.assertFalse(response['ok'])
-
-    async def test_malformed_unknown_and_execution_failure(self):
-        async def execute(command): raise ValueError('Wi-Fi no conectado')
-        link = BackendLink(Config(), execute)
-        for raw in ('{', '[]', '{}'):
-            self.assertEqual((await link.process(raw))['type'], 'protocol_error')
-        for command in ('reset.credentials', 'tcp.enable'):
-            response = await link.process(json.dumps({'type':'command', 'id':command, 'command':command}))
-            self.assertFalse(response['ok'])
-
-    async def test_cancel_waits_for_inflight_mutation(self):
-        started, finished = asyncio.Event(), asyncio.Event()
-        async def execute(command):
-            started.set()
-            await finished.wait()
-            return {}
-        link = BackendLink(Config(), execute)
-        task = asyncio.create_task(link.process('{"type":"command","id":"one","command":"tcp.enable"}'))
-        await started.wait()
-        task.cancel()
+class TCPTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.net = FakeNetwork()
+        self.ctrl = Controller(replace(Config(), ap_ip='127.0.0.1', tcp_port=0), self.net)
+        self.ctrl.creds = Credentials('Casa', '12345678')
+        self.ctrl.online = True
+        self.net.ap_active = True
+        self.service = TCPService(self.ctrl)
+        await self.service.reconcile()
+        self.port = self.service.server.sockets[0].getsockname()[1]
+    async def asyncTearDown(self):
+        await self.service.close()
         await asyncio.sleep(0)
-        self.assertFalse(task.done())
-        finished.set()
-        with self.assertRaises(asyncio.CancelledError): await task
+    async def test_real_socket_fragmentation_and_ack(self):
+        r, w = await asyncio.open_connection('127.0.0.1', self.port)
+        packet = encode(HEADER, 0, 1, b'\x00')
+        for b in packet:
+            w.write(bytes([b]))
+            await w.drain()
+            await asyncio.sleep(.001)
+        response = await read_frame(r)
+        self.assertEqual(response, Frame(ACK, 1, 2, credentials_frame(self.ctrl.creds)[4:]))
+        self.assertEqual(self.ctrl.delivered, 1)
+        w.write(encode(ACK, 3, 0, b'\x01'))
+        await w.drain()
+        self.assertEqual(await asyncio.wait_for(r.read(), 1), b'')
+        w.close()
+        await w.wait_closed()
+    async def test_nack_before_validation_and_bad_request_not_touch_timer(self):
+        r, w = await asyncio.open_connection('127.0.0.1', self.port)
+        original = self.ctrl.last_request
+        self.ctrl.online = False
+        w.write(encode(HEADER, 0, 1, b'\x00'))
+        await w.drain()
+        self.assertTrue((await read_frame(r)).nack)
+        self.ctrl.online = True
+        w.write(encode(HEADER, 0, 7, b'\x00'))
+        await w.drain()
+        self.assertTrue((await read_frame(r)).nack)
+        self.assertEqual(self.ctrl.last_request, original)
+        w.close()
+        await w.wait_closed()
+    async def test_listener_and_existing_clients_close_with_ap(self):
+        r, w = await asyncio.open_connection('127.0.0.1', self.port)
+        await asyncio.sleep(0)
+        self.net.ap_active = False
+        await self.service.reconcile()
+        self.assertIsNone(self.service.server)
+        self.assertEqual(await asyncio.wait_for(r.read(), 1), b'')
+        with self.assertRaises(OSError):
+            await asyncio.open_connection('127.0.0.1', self.port)
+        w.close()
+        await w.wait_closed()
 
-
-class ConfigurationTests(unittest.TestCase):
-    def test_old_config_and_environment_override(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'config.json'
-            path.write_text(json.dumps({'admin_token': 'A'*32}))
-            with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(Config.load(path).backend_ws_url, '')
-            values = {'SELFIQ_BACKEND_WS_URL': 'ws://192.168.1.100:8000/ws/gateways',
-                      'SELFIQ_GATEWAY_ID': 'rpi-01', 'SELFIQ_GATEWAY_TOKEN': 'G'*32}
-            with patch.dict(os.environ, values, clear=True):
-                self.assertEqual(Config.load(path).gateway_id, 'rpi-01')
-            values['SELFIQ_GATEWAY_ID'] = '../another-gateway'
-            with patch.dict(os.environ, values, clear=True):
-                with self.assertRaises(ValueError): Config.load(path)
-
-
-class IntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_backend_to_rpi_to_esp_real_sockets_reconnect_and_credentials_unchanged(self):
-        backend = create_backend({'rpi-01':'G'*32}, 'A'*32)
-        with tempfile.TemporaryDirectory() as directory:
-            config = replace(Config(), admin_token='L'*32, state_file=directory+'/credentials.json',
-                             ap_ip='127.0.0.1', tcp_port=0, gateway_id='rpi-01', gateway_token='G'*32)
-            atomic_json(config.state_file, {'profile':'selfiq-sta-a',
-                        'credentials': {'ssid':'Local','password':'12345678','kind':1,'username':''}})
-            saved = Path(config.state_file).read_bytes()
-            async with serve(backend) as port:
-                config.backend_ws_url = f'ws://127.0.0.1:{port}/ws/gateways'
-                rpi = create_app(config, FakeNetwork())
-                async with serve(rpi):
-                    async with httpx.AsyncClient(trust_env=False, base_url=f'http://127.0.0.1:{port}',
-                                                 headers={'X-SelfIQ-Token':'A'*32}) as client:
-                        for _ in range(200):
-                            if 'rpi-01' in backend.state.sessions: break
-                            await asyncio.sleep(.01)
-                        self.assertIn('rpi-01', backend.state.sessions)
-                        response = await client.post('/gateways/rpi-01/commands', json={'command':'tcp.enable'})
-                        result = response.json()
-                        self.assertTrue(result['ok'])
-                        self.assertTrue(result['data']['tcp_activo'])
-                        self.assertNotIn('ssid', result['data'])
-                        self.assertNotIn('12345678', json.dumps(result))
-                        tcp = rpi.state.tcp
-                        reader, writer = await asyncio.open_connection('127.0.0.1', tcp.server.sockets[0].getsockname()[1])
-                        writer.write(encode(HEADER, 0, 1, b'\x00'))
-                        await writer.drain()
-                        self.assertEqual((await read_frame(reader)).data, credentials_frame(Credentials('Local','12345678'))[4:])
-                        stopped = (await client.post('/gateways/rpi-01/commands', json={'command':'tcp.disable'})).json()
-                        self.assertTrue(stopped['ok'])
-                        self.assertFalse(stopped['data']['tcp_activo'])
-                        self.assertEqual(await asyncio.wait_for(reader.read(), 1), b'')
-                        writer.close()
-                        await writer.wait_closed()
-                        self.assertEqual(Path(config.state_file).read_bytes(), saved)
-                        self.assertTrue(rpi.state.controller.online)
-                        old = backend.state.sessions['rpi-01']
-                        await old['ws'].close(code=1012)
-                        for _ in range(400):
-                            if backend.state.sessions.get('rpi-01') not in (None, old): break
-                            await asyncio.sleep(.01)
-                        self.assertIsNot(backend.state.sessions.get('rpi-01'), old)
-                        self.assertIn('rpi-01', backend.state.sessions)
-                        result = (await client.post('/gateways/rpi-01/commands', json={'command':'status'})).json()
-                        self.assertTrue(result['ok'])
-
-    async def test_auth_offline_unknown_and_invalid_command(self):
-        backend = create_backend({'rpi-01':'G'*32}, 'A'*32)
-        async with serve(backend) as port:
-            async with httpx.AsyncClient(trust_env=False, base_url=f'http://127.0.0.1:{port}') as client:
-                path = '/gateways/rpi-01/commands'
-                self.assertEqual((await client.post(path, json={'command':'tcp.enable'})).status_code, 403)
-                client.headers['X-SelfIQ-Token'] = 'A'*32
-                self.assertEqual((await client.post(path, json={'command':'tcp.enable'})).status_code, 503)
-                self.assertEqual((await client.post(path, json={'command':'wipe'})).status_code, 422)
-                self.assertEqual((await client.get('/gateways/other')).status_code, 404)
-            with self.assertRaises(InvalidStatus):
-                async with connect(f'ws://127.0.0.1:{port}/ws/gateways/rpi-01',
-                                   additional_headers={'Authorization':'Bearer wrong'}): pass
-
-    async def test_timeout_and_disconnect_do_not_report_success(self):
-        backend = create_backend({'rpi-01':'G'*32}, 'A'*32, timeout=.05)
-        async with serve(backend) as port:
-            async with connect(f'ws://127.0.0.1:{port}/ws/gateways/rpi-01',
-                               additional_headers={'Authorization':'Bearer '+'G'*32}) as ws:
-                async with httpx.AsyncClient(trust_env=False, base_url=f'http://127.0.0.1:{port}',
-                                             headers={'X-SelfIQ-Token':'A'*32}) as client:
-                    task = asyncio.create_task(client.post('/gateways/rpi-01/commands', json={'command':'status'}))
-                    await ws.recv()
-                    self.assertEqual((await task).status_code, 504)
-                    task = asyncio.create_task(client.post('/gateways/rpi-01/commands', json={'command':'status'}))
-                    await ws.recv()
-                    await ws.close()
-                    self.assertEqual((await task).status_code, 503)
+    async def test_idle_timeout_closes_listener_and_clients_after_valid_request(self):
+        now = [1000]
+        self.ctrl.clock = lambda: now[0]
+        self.ctrl.profile = 'selfiq-sta-a'
+        self.net.current = self.ctrl.profile
+        self.ctrl.touch()
+        reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
+        now[0] += 299
+        writer.write(encode(HEADER, 0, 1, b'\x00'))
+        await writer.drain()
+        await read_frame(reader)
+        now[0] += 299
+        self.ctrl.tick()
+        await self.service.reconcile()
+        self.assertIsNotNone(self.service.server)
+        now[0] += 1
+        self.ctrl.tick()
+        await self.service.reconcile()
+        self.assertIsNone(self.service.server)
+        self.assertEqual(await asyncio.wait_for(reader.read(), 1), b'')
+        self.assertTrue(self.ctrl.online)
+        writer.close()
+        await writer.wait_closed()

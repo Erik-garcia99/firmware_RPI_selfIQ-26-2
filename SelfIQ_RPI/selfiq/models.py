@@ -76,12 +76,14 @@ class Config:
         # Optional outbound backend link; existing installations remain compatible.
         for field in ('gateway_id', 'gateway_token'):
             setattr(result, field, os.environ.get('SELFIQ_' + field.upper(), getattr(result, field)))
-        result.backend_ws_url = os.environ.get('SELFIQ_BACKEND_WS_URL', '').strip().rstrip('/')
-        if result.backend_ws_url:
-            from urllib.parse import urlsplit
-            url = urlsplit(result.backend_ws_url)
-            if url.scheme not in ('ws', 'wss') or not url.hostname or url.username or url.password or url.query or url.fragment:
-                raise ValueError('backend_ws_url requiere ws:// o wss:// sin credenciales ni query')
+        # Prefer explicit WS endpoint, then public HTTPS base URL, then config.json.
+        # An unset environment no longer erases the saved URL.
+        source = (os.environ.get('SELFIQ_BACKEND_WS_URL', '').strip()
+                  or os.environ.get('SELFIQ_BACKEND_URL', '').strip()
+                  or result.backend_ws_url)
+        if source:
+            from .backend_config import websocket_url
+            result.backend_ws_url = websocket_url(source)
         if result.gateway_id and not re_safe_id(result.gateway_id):
             raise ValueError('gateway_id incorrecto')
         # Missing/invalid enrollment token must not stop Wi-Fi provisioning or the service.
