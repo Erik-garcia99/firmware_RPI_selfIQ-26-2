@@ -49,6 +49,12 @@ class Network:
         except NetworkError:
             return False
 
+    def enable_autoconnect(self, name):
+        # Only SelfIQ-owned profile names. Does not activate or disconnect wlan0.
+        if name in ('selfiq-sta-a', 'selfiq-sta-b') and self.profile_exists(name):
+            self.run('nmcli', 'connection', 'modify', name,
+                     'connection.autoconnect', 'yes', optional=True)
+
     def channel(self):
         info = self.run('iw', 'dev', self.c.sta_interface, 'info')
         match = re.search(r'channel (\d+)', info)
@@ -66,7 +72,7 @@ class Network:
         if creds.kind != 1:
             raise NetworkError('Solo se admite Wi-Fi Personal (WPA2-PSK)')
         args = ['nmcli', 'connection', 'add', 'type', 'wifi', 'ifname', self.c.sta_interface,
-                'con-name', name, 'ssid', creds.ssid, 'connection.autoconnect', 'no',
+                'con-name', name, 'ssid', creds.ssid, 'connection.autoconnect', 'yes',
                 'ipv4.method', 'auto', 'ipv6.method', 'disabled',
                 '802-11-wireless.band', 'bg',
                 'wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', creds.password]
@@ -154,6 +160,3 @@ class Network:
             if self.c.virtual_ap:
                 self.run('iw', 'dev', self.c.ap_interface, 'del', optional=True)
 
-    def disconnect_sta(self):
-        # No desconectar wlan0: puede tener un perfil del usuario ajeno a SelfIQ.
-        pass
