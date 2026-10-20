@@ -6,7 +6,7 @@ HEADER = 0xABCD
 ACK = 0x5433
 NACK = bytes.fromhex('54 33 FF FF 00')
 SSID, PASSWORD, USER = 0x69, 0x70, 0x75
-MAX_DATA = 160
+MAX_DATA = 100
 
 @dataclass(frozen=True)
 class Frame:
@@ -48,4 +48,4 @@ def credentials_frame(creds):
     if creds.kind == 2:
         data += tlv(USER, creds.username)
     data += tlv(PASSWORD, creds.password)
-    return encode(ACK, creds.kind, 2, data)
+    return encode(ACK, 1, 2, data)

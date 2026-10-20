@@ -31,10 +31,10 @@ class TCPService:
             # Idle clients do not keep provisioning alive.
             for _ in range(32):
                 frame = await read_frame(reader)
-                if frame.header == HEADER and frame.kind == 0 and frame.action == 1 and frame.data == b'\x00':
+                if frame.header == HEADER and frame.kind == 1 and frame.action == 1 and frame.data in (b'', b'\x00'):
                     creds = self.ctrl.requested_credentials()
                     payload = credentials_frame(creds) if creds else NACK
-                elif frame.header == ACK and frame.kind == 3 and frame.action == 0 and frame.data == b'\x01':
+                elif frame.header == ACK and frame.kind == 3 and frame.action == 0:
                     # Receipt acknowledgment, not proof ESP joined the final Wi-Fi.
                     break
                 else:

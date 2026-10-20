@@ -11,7 +11,18 @@ if [[ "$sta_iface" == "$ap_iface" ]]; then echo 'STA y AP requieren interfaces d
 if [[ ! "$sta_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$ap_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$wifi_country" =~ ^[A-Z]{2}$ ]]; then echo 'Interfaz o país inválidos'; exit 1; fi
 echo 'Instalando SelfIQ. El inicio del servicio puede cambiar la conexión Wi-Fi de esta Raspberry.'
 apt-get update
-apt-get install -y python3-venv network-manager iw hostapd dnsmasq iproute2 rfkill curl ca-certificates
+apt-get install -y python3-venv network-manager iw hostapd dnsmasq iproute2 rfkill curl ca-certificates avahi-daemon avahi-utils
+# Only announce the gateway hostname; TCP remains bound to the AP.
+# Remove the former misleading service record if it was installed.
+rm -f /etc/avahi/services/selfiq-broker.service
+# Avahi host-name is independent of the system's Linux hostname.
+if grep -qE '^#?host-name=' /etc/avahi/avahi-daemon.conf; then
+  sed -i -E 's/^#?host-name=.*/host-name=selfiq-gateway/' /etc/avahi/avahi-daemon.conf
+else
+  sed -i '/^\[server\]/a host-name=selfiq-gateway' /etc/avahi/avahi-daemon.conf
+fi
+systemctl enable --now avahi-daemon.service
+systemctl restart avahi-daemon.service
 # SelfIQ launches its own isolated hostapd/dnsmasq processes; avoid double listeners.
 systemctl disable --now hostapd.service dnsmasq.service
 systemctl unmask hostapd.service
