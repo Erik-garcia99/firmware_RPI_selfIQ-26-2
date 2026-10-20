@@ -60,20 +60,16 @@ class Network:
         return channel
 
     def candidate(self, name, creds):
+        # Solo administrar perfiles propios de SelfIQ; nunca borrar la red existente.
         if self.profile_exists(name):
-            self.run('nmcli', 'connection', 'delete', name)
+            raise NetworkError('Perfil SelfIQ ya existente; no se reemplazará automáticamente')
+        if creds.kind != 1:
+            raise NetworkError('Solo se admite Wi-Fi Personal (WPA2-PSK)')
         args = ['nmcli', 'connection', 'add', 'type', 'wifi', 'ifname', self.c.sta_interface,
                 'con-name', name, 'ssid', creds.ssid, 'connection.autoconnect', 'no',
-                'ipv4.method', 'auto', 'ipv6.method', 'disabled', '802-11-wireless.band', 'bg']
-        if creds.kind == 1:
-            args += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', creds.password]
-        else:
-            if not self.c.enterprise_domain or not Path(self.c.enterprise_ca).is_file():
-                raise NetworkError('Enterprise requiere CA y dominio RADIUS configurados en /etc/selfiq/config.json')
-            args += ['wifi-sec.key-mgmt', 'wpa-eap', '802-1x.eap', 'peap',
-                     '802-1x.phase2-auth', 'mschapv2', '802-1x.identity', creds.username,
-                     '802-1x.password', creds.password, '802-1x.ca-cert', self.c.enterprise_ca,
-                     '802-1x.domain-suffix-match', self.c.enterprise_domain]
+                'ipv4.method', 'auto', 'ipv6.method', 'disabled',
+                '802-11-wireless.band', 'bg',
+                'wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', creds.password]
         self.run(*args)
 
     def ap_healthy(self):
@@ -159,4 +155,5 @@ class Network:
                 self.run('iw', 'dev', self.c.ap_interface, 'del', optional=True)
 
     def disconnect_sta(self):
-        self.run('nmcli', 'device', 'disconnect', self.c.sta_interface, optional=True)
+        # No desconectar wlan0: puede tener un perfil del usuario ajeno a SelfIQ.
+        pass

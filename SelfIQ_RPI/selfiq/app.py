@@ -217,8 +217,6 @@ def create_app(config, network=None):
             creds = Credentials(**json.loads(raw)).validate()
         except (ValueError, TypeError):
             raise HTTPException(422, 'Credenciales inválidas: revise tipo y longitudes en bytes')
-        if creds.kind == 2 and (not config.enterprise_domain or not Path(config.enterprise_ca).is_file()):
-            raise HTTPException(422, 'El instalador debe configurar CA y dominio RADIUS para Enterprise')
         ctrl.busy = True
         async def perform():
             await asyncio.sleep(2)  # Give the HTTP response time to reach the phone.

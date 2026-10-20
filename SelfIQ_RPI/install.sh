@@ -9,7 +9,7 @@ wifi_country="${WIFI_COUNTRY:-MX}"
 if [[ "$virtual_ap" != true && "$virtual_ap" != false ]]; then echo 'VIRTUAL_AP debe ser true o false'; exit 1; fi
 if [[ "$sta_iface" == "$ap_iface" ]]; then echo 'STA y AP requieren interfaces distintas'; exit 1; fi
 if [[ ! "$sta_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$ap_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$wifi_country" =~ ^[A-Z]{2}$ ]]; then echo 'Interfaz o país inválidos'; exit 1; fi
-echo 'Instalando SelfIQ. El inicio del servicio puede cambiar la conexión Wi-Fi de esta Raspberry.'
+echo 'Instalando SelfIQ sin desconectar ni sobrescribir la Wi-Fi existente.'
 apt-get update
 apt-get install -y python3-venv network-manager iw hostapd dnsmasq iproute2 rfkill curl ca-certificates avahi-daemon avahi-utils
 # Only announce the gateway hostname; TCP remains bound to the AP.
@@ -24,11 +24,8 @@ fi
 systemctl enable --now avahi-daemon.service
 systemctl restart avahi-daemon.service
 # SelfIQ launches its own isolated hostapd/dnsmasq processes; avoid double listeners.
-systemctl disable --now hostapd.service dnsmasq.service
-systemctl unmask hostapd.service
-systemctl enable --now NetworkManager.service
-rfkill unblock wifi
-iw reg set "$wifi_country"
+systemctl disable hostapd.service dnsmasq.service
+systemctl enable NetworkManager.service
 install -d -m 755 /opt/selfiq
 install -d -m 700 /etc/selfiq /var/lib/selfiq
 cp -r "$task_source_dir/selfiq" /opt/selfiq/
@@ -51,7 +48,7 @@ PY
 fi
 # Create configuration guidance once; never overwrite a deployed URL/token.
 if [[ ! -f /etc/selfiq/backend.env ]]; then
-  install -m 600 "$task_source_dir/config/backend.env.example" /etc/selfiq/backend.env
+  install -m 600 /dev/null /etc/selfiq/backend.env
 fi
 # Config is authoritative on reinstallation; do not silently alter interface mapping/token.
 configured_ap="$(/opt/selfiq/.venv/bin/python -c 'import json; print(json.load(open("/etc/selfiq/config.json"))["ap_interface"])')"
@@ -61,11 +58,11 @@ cat > /etc/NetworkManager/conf.d/90-selfiq-ap.conf <<EOF
 [keyfile]
 unmanaged-devices=interface-name:$configured_ap
 EOF
-nmcli general reload
 install -m 644 "$task_source_dir/selfiq.service" /etc/systemd/system/selfiq.service
 systemctl daemon-reload
 systemctl enable selfiq.service
-systemctl restart selfiq.service
+# La instalación no inicia ni reinicia SelfIQ, para proteger la conexión remota.
+echo 'Servicio instalado, pero no iniciado. Para iniciarlo: sudo systemctl start selfiq.service'
 echo 'Instalado. Estado: sudo systemctl status selfiq --no-pager'
 echo 'Página: conecte el teléfono a SelfIQ-Admi y abra http://192.168.50.1'
 echo 'Backend Railway: edite sudo nano /etc/selfiq/backend.env y reinicie selfiq.'

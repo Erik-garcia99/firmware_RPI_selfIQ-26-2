@@ -20,9 +20,6 @@ class Credentials:
         if self.kind == 1:
             if not 8 <= len(self.password.encode()) <= 63 or self.username:
                 raise ValueError('WPA2 Personal: contraseña de 8–63 bytes; sin usuario')
-        elif self.kind == 2:
-            if not 1 <= len(self.username.encode()) <= 31 or not 1 <= len(self.password.encode()) <= 64:
-                raise ValueError('Enterprise: usuario de 1–31 y contraseña de 1–64 bytes')
         else:
             raise ValueError('Tipo de red desconocido')
         return self
@@ -59,8 +56,6 @@ class Config:
     idle_seconds: int = 300
     connect_timeout: int = 45
     retry_seconds: int = 60
-    enterprise_ca: str = '/etc/ssl/certs/ca-certificates.crt'
-    enterprise_domain: str = ''
     admin_token: str = ''
     state_file: str = '/var/lib/selfiq/credentials.json'
     runtime_dir: str = '/run/selfiq'
@@ -72,7 +67,10 @@ class Config:
 
     @classmethod
     def load(cls, path):
-        result = cls(**json.loads(Path(path).read_text()))
+        settings = json.loads(Path(path).read_text())
+        settings.pop('enterprise_ca', None)
+        settings.pop('enterprise_domain', None)
+        result = cls(**settings)
         # Optional outbound backend link; existing installations remain compatible.
         for field in ('gateway_id', 'gateway_token'):
             setattr(result, field, os.environ.get('SELFIQ_' + field.upper(), getattr(result, field)))

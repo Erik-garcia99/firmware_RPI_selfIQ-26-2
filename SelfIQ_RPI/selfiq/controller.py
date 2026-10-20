@@ -21,6 +21,7 @@ class Controller:
         self.last_retry = 0
         self.ap_wanted = True
         self.delivered = 0
+        self.external_wifi = False
 
     def touch(self):
         with self.lock:
@@ -38,6 +39,16 @@ class Controller:
                 pass
             except (ValueError, KeyError, TypeError):
                 self.error = 'Credenciales guardadas inválidas; configure de nuevo'
+            # Un Wi-Fi preexistente administrado por NetworkManager es intocable.
+            active_name = self.net.run('nmcli', '-g', 'GENERAL.CONNECTION', 'device',
+                                       'show', self.c.sta_interface, optional=True)
+            active_ip = self.net.run('nmcli', '-g', 'IP4.ADDRESS', 'device',
+                                     'show', self.c.sta_interface, optional=True)
+            if active_name and active_name != '--' and active_ip and active_ip != '--' and active_name != self.profile:
+                self.external_wifi = True
+                self.online = True
+                self.ap_wanted = False
+                return
             self.net.stop_ap()
             if self.creds and not self.net.profile_exists(self.profile):
                 try:
@@ -63,7 +74,7 @@ class Controller:
                     self.net.stop_ap()
                 self.net.candidate(candidate, creds)
                 if not self.net.activate(candidate):
-                    raise RuntimeError('No conectó: compruebe SSID, contraseña, señal y configuración Enterprise')
+                    raise RuntimeError('No conectó: compruebe SSID, contraseña y señal')
                 atomic_json(self.c.state_file, {'profile': candidate, 'credentials': asdict(creds)})
                 self.creds, self.profile, self.online = creds, candidate, True
                 self.error = ''
@@ -93,6 +104,8 @@ class Controller:
     def tick(self):
         with self.lock:
             if self.busy:
+                return
+            if self.external_wifi:
                 return
             was_online = self.online
             self.online = bool(self.profile and self.net.active(self.profile))

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 HEADER = 0xABCD
 ACK = 0x5433
 NACK = bytes.fromhex('54 33 FF FF 00')
-SSID, PASSWORD, USER = 0x69, 0x70, 0x75
+SSID, PASSWORD = 0x69, 0x70
 MAX_DATA = 100
 
 @dataclass(frozen=True)
@@ -45,7 +45,5 @@ def tlv(field, value):
 
 def credentials_frame(creds):
     data = tlv(SSID, creds.ssid)
-    if creds.kind == 2:
-        data += tlv(USER, creds.username)
     data += tlv(PASSWORD, creds.password)
     return encode(ACK, 1, 2, data)
