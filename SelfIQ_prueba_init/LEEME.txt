@@ -1,0 +1,36 @@
+PRUEBA CONTROLADA WIFI -> AP HTTP -> STA -> TCP ESP32
+
+PRECONDICIÓN: acceso físico a la Raspberry o a su consola como recuperación.
+Utilizar el código SelfIQ más reciente; NO ejecutar instaladores anteriores.
+
+1. Copiar el script a la Raspberry y, desde la raíz del proyecto:
+   sudo install -m 755 selfiq-wifi-test /usr/local/sbin/selfiq-wifi-test
+2. Iniciar prueba desde la sesión SSH:
+   sudo selfiq-wifi-test start
+   No seguir intentando usar la sesión SSH: en 20 segundos se desconectará.
+3. Desde otro dispositivo, conectarse a:
+   SSID: SelfIQ-Admi
+   Contraseña: $elfIQ-4dmi-1
+   Página: http://192.168.50.1
+4. En HTTP, configurar SSID y contraseña WPA2 Personal actuales. Durante el cambio
+   de canal es normal que desaparezca temporalmente el AP.
+5. Verificar que la Raspberry se unió al Wi-Fi y que la ESP32 recibe credenciales
+   por TCP 192.168.50.1:5000 antes del cierre de aprovisionamiento (300 s).
+6. Recuperar SSH por la IP normal y ejecutar:
+   sudo selfiq-wifi-test status
+   sudo selfiq-wifi-test cancel
+   sudo journalctl -u selfiq -n 80 --no-pager
+7. Si falla HTTP/AP/TCP, NO hay que intentar ejecutar comandos por una sesión SSH
+   que ya perdió la conexión. La tarea local restaurará la red anterior a los 8 min.
+   Comprobar posteriormente con acceso local o nueva sesión SSH.
+
+AVISOS:
+- No se borra la identidad /var/lib/selfiq/gateway.json ni backend.env.
+- Los archivos de copia de perfiles Wi-Fi (con secretos) permanecen bajo
+  /var/lib/selfiq/wifi-test-backup/ con acceso root; elimínelos al terminar.
+- Si falla el firmware del AP o AP+STA, la prueba no puede garantizarse por software.
+- Si hay otro perfil del mismo SSID en NetworkManager que no sea el activo, podría
+  reconectarse antes de abrir el AP. Compruebe perfiles con nmcli connection show.
+- La recuperación a los 8 minutos omite la restauración si ya existe una nueva
+  conexión SelfIQ validada, para no interrumpir una prueba exitosa.
+- No cambie el token de sucursal ni vuelva a registrar el gateway.
