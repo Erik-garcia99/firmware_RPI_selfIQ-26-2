@@ -11,6 +11,7 @@ from .models import Config, Credentials
 from .network import Network
 from .controller import Controller
 from .backend_link import BackendLink
+from .mqtt_bridge import MQTTBridge
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 
 log = logging.getLogger('selfiq')
@@ -106,6 +107,7 @@ def create_app(config, network=None):
         return await execute('status')
 
     backend = BackendLink(config, execute)
+    mqtt_bridge = MQTTBridge(config, backend)
 
     def job(coro):
         task = asyncio.create_task(coro)
@@ -129,6 +131,7 @@ def create_app(config, network=None):
         await tcp.reconcile()
         task = asyncio.create_task(monitor())
         backend_task = asyncio.create_task(backend.run())
+        await mqtt_bridge.start()
         try:
             yield
         finally:
@@ -136,6 +139,7 @@ def create_app(config, network=None):
             # Let a network mutation finish before cancelling the command reader.
             if ctrl.busy:
                 await asyncio.gather(*tuple(jobs), return_exceptions=True)
+            await mqtt_bridge.stop()
             backend_task.cancel()
             await asyncio.gather(task, backend_task, return_exceptions=True)
             # Complete in-flight network mutations before shutting children down.
@@ -148,6 +152,7 @@ def create_app(config, network=None):
     app.state.controller = ctrl
     app.state.tcp = tcp
     app.state.backend = backend
+    app.state.mqtt_bridge = mqtt_bridge
     app.state.execute_command = execute
     session = secrets.token_urlsafe(32)
     ap_subnet = ipaddress.ip_network(config.ap_ip + '/24', strict=False)
@@ -191,6 +196,14 @@ def create_app(config, network=None):
             raise HTTPException(409, 'Wi-Fi ya configurado; active TCP para agregar una ESP32')
         html = Path(__file__).with_name('index.html').read_text()
         return html.replace('__SESSION__', session).replace('__AP_IP__', config.ap_ip)
+
+    @app.get('/admin/mqtt/status')
+    async def mqtt_status(request: Request):
+        admin(request)
+        return {'broker_connected': mqtt_bridge.connected,
+                'gateway_registered': backend.connected,
+                'pending_registrations': len(mqtt_bridge.pending),
+                'node_type_for_plain_mac': mqtt_bridge.default_node_type}
 
     @app.get('/status')
     async def status():
