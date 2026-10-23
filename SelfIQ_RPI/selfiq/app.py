@@ -131,6 +131,7 @@ def create_app(config, network=None):
         await tcp.reconcile()
         task = asyncio.create_task(monitor())
         backend_task = asyncio.create_task(backend.run())
+        log.info('SelfIQ: cargando puente MQTT de registro ESP32')
         await mqtt_bridge.start()
         try:
             yield

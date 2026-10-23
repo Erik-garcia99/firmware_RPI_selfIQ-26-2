@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 
 import paho.mqtt.client as mqtt
 
-from .gateway_identity import GatewayIdentity
+from .backend_config import websocket_url
 
 log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
@@ -33,10 +33,11 @@ class MQTTBridge:
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
 
     def endpoint(self):
-        base = urlsplit(self.config.backend_ws_url)
+        base = urlsplit(websocket_url(self.config.backend_ws_url))
         scheme = 'https' if base.scheme == 'wss' else 'http'
         return urlunsplit((scheme, base.netloc,
-                           '/gateways/' + quote(self.config.gateway_id, safe='') + '/nodes/register', '', ''))
+                           base.path.removesuffix('/ws/gateways') + '/gateways/'
+                           + quote(self.config.gateway_id, safe='') + '/nodes/register', '', ''))
 
     def _signed_post(self, mac, node_type):
         identity = self.backend.ensure_identity()
@@ -56,10 +57,22 @@ class MQTTBridge:
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
-            client.subscribe(REQUEST, qos=1)
-            log.info('MQTT: Raspberry suscrita a %s', REQUEST)
+            result, _ = client.subscribe(REQUEST, qos=1)
+            if result != mqtt.MQTT_ERR_SUCCESS:
+                log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
+            else:
+                log.info('MQTT conectado; solicitando suscripción a %s', REQUEST)
         else:
             log.warning('MQTT broker rechazó conexión: %s', reason_code)
+
+    def _on_subscribe(self, client, userdata, mid, reason_codes, properties):
+        if not reason_codes or any(code.is_failure for code in reason_codes):
+            log.error('Broker rechazó suscripción a %s: %s', REQUEST, reason_codes)
+            return
+        log.info('MQTT: Raspberry suscrita a %s', REQUEST)
+
+    def _on_connect_fail(self, client, userdata):
+        log.warning('MQTT: no se pudo conectar a 127.0.0.1:1883; reintentando')
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
         self.connected = False
@@ -87,6 +100,7 @@ class MQTTBridge:
         def enqueue():
             if mac in self.pending or self.queue.full():
                 return
+            log.info('Solicitud ESP32 recibida: MAC=%s tipo=%s', mac, node_type)
             self.pending.add(mac)
             self.queue.put_nowait((mac, node_type))
         if self.loop is not None:
@@ -100,6 +114,8 @@ class MQTTBridge:
                     log.warning('Registro %s pendiente: el gateway no está registrado en Railway', mac)
                     continue  # La ESP32 reenvía cada 30 segundos hasta recibir un ID.
                 response = await asyncio.to_thread(self._signed_post, mac, node_type)
+                if not isinstance(response, dict) or response.get('registration_status') != 'registered':
+                    raise ValueError('Backend no confirmó el registro')
                 esp_id, branch_id = response['esp_id'], response['branch_id']
                 if not UUID_RE.fullmatch(esp_id) or not UUID_RE.fullmatch(branch_id):
                     raise ValueError('El backend devolvió IDs incorrectos')
@@ -112,17 +128,29 @@ class MQTTBridge:
                     raise RuntimeError(f'Publicación MQTT fallida rc={info.rc}')
                 log.info('ESP32 registrada: %s -> %s (sucursal %s)', mac, esp_id, branch_id)
             except HTTPError as exc:
-                log.error('Backend rechazó registro de %s (HTTP %s)', mac, exc.code)
+                detail = ''
+                try:
+                    body = json.loads(exc.read(2048))
+                    if isinstance(body, dict) and isinstance(body.get('detail'), str):
+                        detail = body['detail'][:300].replace('\n', ' ')
+                except (ValueError, OSError):
+                    pass
+                log.error('Backend rechazó registro de %s (HTTP %s): %s', mac, exc.code, detail)
             except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
                 log.warning('Registro de ESP32 pendiente (%s): %s', mac, type(exc).__name__)
+            except Exception:
+                log.exception('Error al registrar ESP32 %s; se permite reintento', mac)
             finally:
                 self.pending.discard(mac)
                 self.queue.task_done()
 
     async def start(self):
+        log.info('Iniciando puente ESP32: MQTT local -> backend -> base de datos')
         self.loop = asyncio.get_running_loop()
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                   client_id='selfiq-gateway-bridge')
+        self.client.on_subscribe = self._on_subscribe
+        self.client.on_connect_fail = self._on_connect_fail
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
