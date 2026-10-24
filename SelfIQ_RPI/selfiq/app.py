@@ -21,6 +21,7 @@ class TCPService:
         self.ctrl = controller
         self.server = None
         self.clients = set()
+        self.health = lambda: (False, False, False)
 
     async def handle(self, reader, writer):
         if len(self.clients) >= 8 or not self.ctrl.ap_wanted or not self.ctrl.net.ap_healthy() or self.ctrl.busy:
@@ -33,8 +34,15 @@ class TCPService:
             for _ in range(32):
                 frame = await read_frame(reader)
                 if frame.header == HEADER and frame.kind == 1 and frame.action == 1 and frame.data in (b'', b'\x00'):
-                    creds = self.ctrl.requested_credentials()
+                    creds = await asyncio.to_thread(self.ctrl.requested_credentials)
                     payload = credentials_frame(creds) if creds else NACK
+                elif frame.header == HEADER and frame.kind == 4 and frame.action == 1 and not frame.data:
+                    await asyncio.to_thread(self.ctrl.touch)
+                    mqtt_ok, backend_ok, storage_ok = self.health()
+                    # v1: version, wifi, backend, mqtt, storage, action (1=stay,2=try STA)
+                    payload = encode(ACK, 4, 2, bytes((1, int(self.ctrl.online),
+                        int(backend_ok), int(mqtt_ok), int(storage_ok),
+                        2 if self.ctrl.can_distribute() else 1)))
                 elif frame.header == ACK and frame.kind == 3 and frame.action == 0:
                     # Receipt acknowledgment, not proof ESP joined the final Wi-Fi.
                     break
@@ -85,7 +93,10 @@ def create_app(config, network=None):
             # Backend receives operational state, never SSID/password/username.
             state = ctrl.status()
             state.pop('ssid', None)
-            return {**state, 'tcp_activo': tcp.server is not None}
+            return {**state, 'tcp_activo': tcp.server is not None,
+                    'backend_connected': backend.connected,
+                    'storage_error': mqtt_bridge.storage_error,
+                    'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
         if ctrl.busy:
             raise ValueError('Configuración en curso')
         if not ctrl.online or not ctrl.creds:
@@ -95,6 +106,8 @@ def create_app(config, network=None):
             if command == 'tcp.enable':
                 await asyncio.to_thread(ctrl.reopen)
             elif command == 'tcp.disable':
+                if ctrl.recovery_ap:
+                    raise ValueError('AP en recuperacion; hay clientes locales o periodo de espera')
                 await tcp.close()
                 await asyncio.to_thread(ctrl.stop_provisioning)
             else:
@@ -108,6 +121,8 @@ def create_app(config, network=None):
 
     backend = BackendLink(config, execute)
     mqtt_bridge = MQTTBridge(config, backend)
+    tcp.health = lambda: (mqtt_bridge.connected, backend.connected,
+                         mqtt_bridge.outbox is not None and not mqtt_bridge.storage_error)
 
     def job(coro):
         task = asyncio.create_task(coro)
@@ -208,7 +223,9 @@ def create_app(config, network=None):
 
     @app.get('/status')
     async def status():
-        return {**ctrl.status(), 'tcp_activo': tcp.server is not None, 'backend_conectado': backend.connected,
+        return {'storage_error': mqtt_bridge.storage_error,
+                'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None,
+                **ctrl.status(), 'tcp_activo': tcp.server is not None, 'backend_conectado': backend.connected,
                 'gateway_id': config.gateway_id, 'branch_id': backend.branch_id,
                 'registration_status': backend.registration_status,
                 'registration_alert': 'Corrija el token de sucursal' if backend.registration_status in ('token_invalid', 'registration_rejected') else None}
@@ -291,8 +308,8 @@ def create_app(config, network=None):
         admin(request)
         if ctrl.busy:
             raise HTTPException(409, 'Configuración en curso')
-        if not ctrl.online:
-            raise HTTPException(409, 'El AP debe permanecer disponible para configurar Wi-Fi')
+        if not ctrl.online or ctrl.recovery_ap:
+            raise HTTPException(409, 'El AP debe permanecer disponible durante recuperacion')
         ctrl.busy = True
         try:
             await tcp.close()
