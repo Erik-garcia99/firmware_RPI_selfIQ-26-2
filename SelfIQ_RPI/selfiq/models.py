@@ -56,6 +56,15 @@ class Config:
     idle_seconds: int = 300
     connect_timeout: int = 45
     retry_seconds: int = 60
+    recovery_rounds: int = 4
+    recovery_attempts: int = 5
+    recovery_retry_seconds: int = 300
+    offline_ap_delay: int = 30
+    offline_db: str = '/var/lib/selfiq/outbox.sqlite3'
+    offline_max_fraction: float = 0.60
+    offline_reserve_fraction: float = 0.20
+    offline_reserve_bytes: int = 2147483648
+    offline_max_payload: int = 8192
     admin_token: str = ''
     state_file: str = '/var/lib/selfiq/credentials.json'
     runtime_dir: str = '/run/selfiq'
@@ -98,6 +107,14 @@ class Config:
             raise ValueError('País incorrecto')
         if not 1 <= result.setup_channel <= 11 or result.idle_seconds < 1 or result.retry_seconds < 1:
             raise ValueError('Canal o tiempos incorrectos')
+        if not (0 < result.offline_max_fraction < 1 and
+                0 < result.offline_reserve_fraction < 1):
+            raise ValueError('Fracciones de almacenamiento invalidas')
+        if (min(result.recovery_rounds, result.recovery_attempts,
+                result.recovery_retry_seconds, result.offline_ap_delay,
+                result.offline_max_payload, result.connect_timeout) < 1
+                or result.offline_reserve_bytes < 0):
+            raise ValueError('Limites de recuperacion invalidos')
         Credentials(result.ap_ssid, result.ap_password).validate()
         if len(result.admin_token) < 32:
             raise ValueError('Falta token administrativo de al menos 32 caracteres')

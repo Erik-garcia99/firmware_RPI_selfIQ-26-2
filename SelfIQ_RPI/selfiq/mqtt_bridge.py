@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 import paho.mqtt.client as mqtt
 
 from .backend_config import websocket_url
+from .outbox import Outbox, StorageFull
 
 log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
@@ -30,6 +31,8 @@ class MQTTBridge:
         self.worker = None
         self.loop = None
         self.pending = set()
+        self.outbox = None
+        self.storage_error = ''
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
 
     def endpoint(self):
@@ -57,7 +60,7 @@ class MQTTBridge:
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
-            result, _ = client.subscribe(REQUEST, qos=1)
+            result, _ = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
             else:
@@ -79,6 +82,26 @@ class MQTTBridge:
         log.warning('MQTT broker desconectado: %s', reason_code)
 
     def _on_message(self, client, userdata, message):
+        parts = message.topic.split('/')
+        if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
+            if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
+                    or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3]) or message.retain):
+                log.warning('[STORAGE] Telemetria/topico invalido o retained; sin ACK')
+                return
+            if self.outbox is None:
+                log.error('[STORAGE] STORAGE_UNAVAILABLE; sin ACK')
+                return
+            try:
+                event_id = self.outbox.put(message.topic, message.payload)
+                self.storage_error = ''
+                # Application receipt: device may release its RAM copy now.
+                client.publish('/'.join(parts[:4]) + '/ack', event_id, qos=1, retain=False)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                log.warning('[STORAGE] INVALID_EVENT: %s', type(exc).__name__)
+            except Exception as exc:
+                self.storage_error = 'STORAGE_FULL' if isinstance(exc, StorageFull) else 'STORAGE_ERROR'
+                log.error('[STORAGE] %s; mensaje NO confirmado', self.storage_error)
+            return
         if message.topic != REQUEST or len(message.payload) > 128:
             return
         try:
@@ -147,6 +170,12 @@ class MQTTBridge:
     async def start(self):
         log.info('Iniciando puente ESP32: MQTT local -> backend -> base de datos')
         self.loop = asyncio.get_running_loop()
+        try:
+            self.outbox = Outbox(self.config)
+            log.info('[STORAGE] Cola SQLite lista; sincronizacion cloud pendiente de integrar')
+        except Exception:
+            self.storage_error = 'STORAGE_UNAVAILABLE'
+            log.exception('[STORAGE] No se pudo abrir SQLite; red/registro siguen disponibles')
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                   client_id='selfiq-gateway-bridge')
         self.client.on_subscribe = self._on_subscribe
@@ -166,3 +195,7 @@ class MQTTBridge:
         if self.client:
             self.client.disconnect()
             await asyncio.to_thread(self.client.loop_stop)
+
+        if self.outbox:
+            await asyncio.to_thread(self.outbox.close)
+            self.outbox = None

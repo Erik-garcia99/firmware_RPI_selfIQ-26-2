@@ -65,10 +65,24 @@ class Network:
             raise NetworkError('El AP requiere canal 2.4 GHz')
         return channel
 
+    def ap_clients(self):
+        try:
+            data = self.run('hostapd_cli', '-p', str(self.runtime / 'hostapd'),
+                            '-i', self.c.ap_interface, 'all_sta')
+            if 'FAIL' in data:
+                return None
+            return len(re.findall(r'(?m)^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$', data))
+        except NetworkError:
+            return None
+
     def candidate(self, name, creds):
         # Solo administrar perfiles propios de SelfIQ; nunca borrar la red existente.
+        if name not in ('selfiq-sta-a', 'selfiq-sta-b'):
+            raise NetworkError('Perfil no administrado por SelfIQ')
         if self.profile_exists(name):
-            raise NetworkError('Perfil SelfIQ ya existente; no se reemplazará automáticamente')
+            if self.active(name):
+                raise NetworkError('No se reemplaza un perfil activo')
+            self.run('nmcli', 'connection', 'delete', name)
         if creds.kind != 1:
             raise NetworkError('Solo se admite Wi-Fi Personal (WPA2-PSK)')
         args = ['nmcli', 'connection', 'add', 'type', 'wifi', 'ifname', self.c.sta_interface,
