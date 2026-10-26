@@ -45,35 +45,41 @@ def atomic_json(path, value):
 
 @dataclass
 class Config:
-    sta_interface: str = 'wlan0'
-    ap_interface: str = 'uap0'
-    virtual_ap: bool = True
-    ap_ip: str = '192.168.50.1'
-    ap_ssid: str = 'SelfIQ-Admi'
-    ap_password: str = '$elfIQ-4dmi-1'
-    country: str = 'MX'
-    setup_channel: int = 6
-    idle_seconds: int = 300
-    connect_timeout: int = 45
-    retry_seconds: int = 60
-    recovery_rounds: int = 4
-    recovery_attempts: int = 5
-    recovery_retry_seconds: int = 300
-    offline_ap_delay: int = 30
-    offline_db: str = '/var/lib/selfiq/outbox.sqlite3'
-    offline_max_fraction: float = 0.60
-    offline_reserve_fraction: float = 0.20
-    offline_reserve_bytes: int = 2147483648
-    offline_max_payload: int = 8192
-    admin_token: str = ''
-    state_file: str = '/var/lib/selfiq/credentials.json'
-    runtime_dir: str = '/run/selfiq'
-    tcp_port: int = 5000
-    backend_ws_url: str = ''
-    gateway_id: str = ''
-    gateway_token: str = ''
-    gateway_state_file: str = '/var/lib/selfiq/gateway.json'
+    sta_interface: str
+    ap_interface: str
+    virtual_ap: bool
+    ap_ip: str
+    ap_ssid: str
+    ap_password: str
+    country: str
+    setup_channel: int
+    idle_seconds: int
+    connect_timeout: int
+    retry_seconds: int
+    recovery_rounds: int
+    recovery_attempts: int
+    recovery_retry_seconds: int
+    offline_ap_delay: int
+    offline_db: str
+    offline_max_fraction: float
+    offline_reserve_fraction: float
+    offline_reserve_bytes: int
+    offline_max_payload: int
+    admin_token: str
+    state_file: str
+    runtime_dir: str
+    tcp_port: int
+    backend_ws_url: str
+    gateway_id: str
+    gateway_token: str
+    gateway_state_file: str
 
+    influx_url: str
+    influx_bucket: str
+    influx_org: str
+    influx_token: str
+
+    
     @classmethod
     def load(cls, path):
         settings = json.loads(Path(path).read_text())

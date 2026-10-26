@@ -12,6 +12,7 @@ from .network import Network
 from .controller import Controller
 from .backend_link import BackendLink
 from .mqtt_bridge import MQTTBridge
+from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 
 log = logging.getLogger('selfiq')
@@ -146,21 +147,59 @@ def create_app(config, network=None):
         await tcp.reconcile()
         task = asyncio.create_task(monitor())
         backend_task = asyncio.create_task(backend.run())
-        log.info('SelfIQ: cargando puente MQTT de registro ESP32')
+        log.info("SelfIQ: cargando puente MQTT de registro ESP32")
         await mqtt_bridge.start()
+        influx_stop = asyncio.Event()
+        influx_task = None
+        if mqtt_bridge.outbox is not None:
+            influx_task = asyncio.create_task(
+                run_influx_sync(
+                    config,
+                    mqtt_bridge.outbox,
+                    influx_stop,
+                ),
+                name="selfiq-influx-sync",
+            )
+        else:
+            log.error(
+                "[INFLUX] No se inicia sincronización: SQLite no disponible"
+            )
         try:
             yield
         finally:
             task.cancel()
-            # Let a network mutation finish before cancelling the command reader.
+            # Esperar cualquier cambio de red que esté en curso.
             if ctrl.busy:
-                await asyncio.gather(*tuple(jobs), return_exceptions=True)
+                await asyncio.gather(
+                    *tuple(jobs),
+                    return_exceptions=True,
+                )
+            # Terminar el envío antes de cerrar SQLite.
+            # No cancelar el hilo mientras utiliza la base de datos.
+            influx_stop.set()
+
+            if influx_task is not None:
+                await asyncio.gather(
+                    influx_task,
+                    return_exceptions=True,
+                )
+
             await mqtt_bridge.stop()
+
             backend_task.cancel()
-            await asyncio.gather(task, backend_task, return_exceptions=True)
-            # Complete in-flight network mutations before shutting children down.
+
+            await asyncio.gather(
+                task,
+                backend_task,
+                return_exceptions=True,
+            )
+
             if jobs:
-                await asyncio.gather(*tuple(jobs), return_exceptions=True)
+                await asyncio.gather(
+                    *tuple(jobs),
+                    return_exceptions=True,
+                )
+
             await tcp.close()
             await asyncio.to_thread(ctrl.shutdown)
 
