@@ -12,6 +12,7 @@ from .network import Network
 from .controller import Controller
 from .backend_link import BackendLink
 from .mqtt_bridge import MQTTBridge
+from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 from .influx_sync import run_influx_sync
 
@@ -149,13 +150,10 @@ def create_app(config, network=None):
 
         task = asyncio.create_task(monitor())
         backend_task = asyncio.create_task(backend.run())
-
         log.info("SelfIQ: cargando puente MQTT de registro ESP32")
         await mqtt_bridge.start()
-
         influx_stop = asyncio.Event()
         influx_task = None
-
         if mqtt_bridge.outbox is not None:
             influx_task = asyncio.create_task(
                 run_influx_sync(
@@ -169,20 +167,17 @@ def create_app(config, network=None):
             log.error(
                 "[INFLUX] No se inicia sincronización: SQLite no disponible"
             )
-
         try:
             yield
 
         finally:
             task.cancel()
-
             # Esperar cualquier cambio de red que esté en curso.
             if ctrl.busy:
                 await asyncio.gather(
                     *tuple(jobs),
                     return_exceptions=True,
                 )
-
             # Terminar el envío antes de cerrar SQLite.
             # No cancelar el hilo mientras utiliza la base de datos.
             influx_stop.set()
@@ -195,6 +190,7 @@ def create_app(config, network=None):
 
             await mqtt_bridge.stop()
 
+
             backend_task.cancel()
 
             await asyncio.gather(
@@ -203,7 +199,19 @@ def create_app(config, network=None):
                 return_exceptions=True,
             )
 
+
+            await asyncio.gather(
+                task,
+                backend_task,
+                return_exceptions=True,
+            )
+
             if jobs:
+                await asyncio.gather(
+                    *tuple(jobs),
+                    return_exceptions=True,
+                )
+
                 await asyncio.gather(
                     *tuple(jobs),
                     return_exceptions=True,

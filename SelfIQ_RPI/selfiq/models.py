@@ -45,7 +45,7 @@ def atomic_json(path, value):
 
 @dataclass
 class Config:
-   sta_interface: str
+    sta_interface: str
     ap_interface: str
     virtual_ap: bool
     ap_ip: str
@@ -79,7 +79,7 @@ class Config:
     influx_org: str
     influx_token: str
 
-
+    
     @classmethod
     def load(cls, path):
         settings = json.loads(Path(path).read_text())

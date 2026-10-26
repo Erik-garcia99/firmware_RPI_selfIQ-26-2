@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import math
@@ -153,4 +152,3 @@ async def run_influx_sync(config, outbox, stop_event):
             pass
 
     log.info("[INFLUX] Sincronización detenida")
-

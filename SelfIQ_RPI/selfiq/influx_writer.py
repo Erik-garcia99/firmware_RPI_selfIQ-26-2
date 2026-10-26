@@ -64,7 +64,3 @@ def enviar_influx(config, line_protocol: str,
         if respuesta.status != HTTPStatus.NO_CONTENT:
             raise RuntimeError(f'Respuesta inesperada de InfluxDB: HTTP {respuesta.status}')
     return True
-
-
-
-
