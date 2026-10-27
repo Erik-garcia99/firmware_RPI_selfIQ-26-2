@@ -13,6 +13,8 @@ from .controller import Controller
 from .backend_link import BackendLink
 from .mqtt_bridge import MQTTBridge
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
+from .influx_sync import run_influx_sync
+
 
 log = logging.getLogger('selfiq')
 
@@ -140,40 +142,75 @@ def create_app(config, network=None):
                 log.exception('Fallo de supervisión')
             await asyncio.sleep(5)
 
-    @asynccontextmanager
+        @asynccontextmanager
     async def lifespan(app):
         await asyncio.to_thread(ctrl.bootstrap)
         await tcp.reconcile()
+
         task = asyncio.create_task(monitor())
         backend_task = asyncio.create_task(backend.run())
-        log.info('SelfIQ: cargando puente MQTT de registro ESP32')
+
+        log.info("SelfIQ: cargando puente MQTT de registro ESP32")
         await mqtt_bridge.start()
+
+        influx_stop = asyncio.Event()
+        influx_task = None
+
+        if mqtt_bridge.outbox is not None:
+            influx_task = asyncio.create_task(
+                run_influx_sync(
+                    config,
+                    mqtt_bridge.outbox,
+                    influx_stop,
+                ),
+                name="selfiq-influx-sync",
+            )
+        else:
+            log.error(
+                "[INFLUX] No se inicia sincronización: SQLite no disponible"
+            )
+
         try:
             yield
+
         finally:
             task.cancel()
-            # Let a network mutation finish before cancelling the command reader.
+
+            # Esperar cualquier cambio de red que esté en curso.
             if ctrl.busy:
-                await asyncio.gather(*tuple(jobs), return_exceptions=True)
+                await asyncio.gather(
+                    *tuple(jobs),
+                    return_exceptions=True,
+                )
+
+            # Terminar el envío antes de cerrar SQLite.
+            # No cancelar el hilo mientras utiliza la base de datos.
+            influx_stop.set()
+
+            if influx_task is not None:
+                await asyncio.gather(
+                    influx_task,
+                    return_exceptions=True,
+                )
+
             await mqtt_bridge.stop()
+
             backend_task.cancel()
-            await asyncio.gather(task, backend_task, return_exceptions=True)
-            # Complete in-flight network mutations before shutting children down.
+
+            await asyncio.gather(
+                task,
+                backend_task,
+                return_exceptions=True,
+            )
+
             if jobs:
-                await asyncio.gather(*tuple(jobs), return_exceptions=True)
+                await asyncio.gather(
+                    *tuple(jobs),
+                    return_exceptions=True,
+                )
+
             await tcp.close()
-            await asyncio.to_thread(ctrl.shutdown)
-
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.controller = ctrl
-    app.state.tcp = tcp
-    app.state.backend = backend
-    app.state.mqtt_bridge = mqtt_bridge
-    app.state.execute_command = execute
-    session = secrets.token_urlsafe(32)
-    ap_subnet = ipaddress.ip_network(config.ap_ip + '/24', strict=False)
-
-    def peer(request):
+            await asyncio.to_thread(ctrl.shutdown)    def peer(request):
         try:
             return ipaddress.ip_address(request.client.host)
         except (ValueError, AttributeError):
