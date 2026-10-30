@@ -99,6 +99,8 @@ def create_app(config, network=None):
                     'backend_connected': backend.connected,
                     'storage_error': mqtt_bridge.storage_error,
                     'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
+        if command == 'node.reset':
+            return await asyncio.to_thread(mqtt_bridge.reset_node, message or {})
         if command == 'light.test':
             # Solo se confirma la entrega al broker local; el firmware actual
             # del nodo todavía no acciona GPIO de luces.

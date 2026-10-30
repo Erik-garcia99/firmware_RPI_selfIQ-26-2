@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import time
+import threading
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -14,6 +15,7 @@ import paho.mqtt.client as mqtt
 
 from .backend_config import websocket_url
 from .outbox import Outbox, StorageFull
+from .node_control import reset_frame, parse_reset_result
 
 log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
@@ -35,6 +37,10 @@ class MQTTBridge:
         self.pending = set()
         self.outbox = None
         self.storage_error = ''
+        self.reset_waiters = {}
+        self.reset_lock = threading.Lock()
+        self.subscriptions_ready = threading.Event()
+        self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
 
     def endpoint(self):
@@ -86,10 +92,38 @@ class MQTTBridge:
         log.info('Prueba de luz publicada en %s (canal %s)', topic, channel)
         return {'published': True, 'channel': channel, 'duration_ms': duration_ms}
 
+    def reset_node(self, message):
+        node_id, branch_id = message.get('node_id'), message.get('branch_id')
+        if not all(isinstance(value, str) and UUID_RE.fullmatch(value)
+                   for value in (node_id, branch_id)):
+            raise ValueError('Identidad del nodo inválida')
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo para recibir la confirmación del nodo')
+        topic = f'selfiq/{branch_id}/{node_id}/control'
+        waiter = {'event': threading.Event(), 'topic': topic + '/result', 'result': None}
+        with self.reset_lock:
+            if waiter['topic'] in self.reset_waiters:
+                raise ValueError('Ya hay un borrado pendiente para este nodo')
+            self.reset_waiters[waiter['topic']] = waiter
+        try:
+            info = self.client.publish(topic + '/command', reset_frame(), qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError('No se pudo enviar el restablecimiento')
+            if not waiter['event'].wait(20):
+                raise ValueError('El nodo no confirmó el borrado de identidad; comprueba que esté conectado y tenga firmware actualizado')
+            if waiter['result'] is not True:
+                raise ValueError('El nodo no pudo borrar su identidad de NVS')
+            return {'identity_reset': True, 'node_id': node_id}
+        finally:
+            with self.reset_lock:
+                self.reset_waiters.pop(waiter['topic'], None)
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
-            result, _ = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1)])
+            self.subscriptions_ready.clear()
+            result, self.subscription_mid = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1),
+                                                              ('selfiq/+/+/control/result', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
             else:
@@ -102,16 +136,32 @@ class MQTTBridge:
             log.error('Broker rechazó suscripción a %s: %s', REQUEST, reason_codes)
             return
         log.info('MQTT: Raspberry suscrita a %s', REQUEST)
+        if mid == self.subscription_mid:
+            self.subscriptions_ready.set()
 
     def _on_connect_fail(self, client, userdata):
         log.warning('MQTT: no se pudo conectar a 127.0.0.1:1883; reintentando')
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
         self.connected = False
+        self.subscriptions_ready.clear()
         log.warning('MQTT broker desconectado: %s', reason_code)
 
     def _on_message(self, client, userdata, message):
         parts = message.topic.split('/')
+        if len(parts) == 5 and parts[3:] == ['control', 'result']:
+            if message.retain or len(message.payload) > 512:
+                return
+            try:
+                result = parse_reset_result(message.payload)
+                with self.reset_lock:
+                    waiter = self.reset_waiters.get(message.topic)
+                    if waiter and waiter['topic'] == message.topic:
+                        waiter['result'] = result
+                        waiter['event'].set()
+            except (ValueError, UnicodeError):
+                pass
+            return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
                     or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3]) or message.retain):
