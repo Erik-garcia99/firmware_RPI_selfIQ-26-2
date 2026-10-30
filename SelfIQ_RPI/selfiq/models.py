@@ -45,26 +45,41 @@ def atomic_json(path, value):
 
 @dataclass
 class Config:
-    sta_interface: str = 'wlan0'
-    ap_interface: str = 'uap0'
-    virtual_ap: bool = True
-    ap_ip: str = '192.168.50.1'
-    ap_ssid: str = 'SelfIQ-Admi'
-    ap_password: str = '$elfIQ-4dmi-1'
-    country: str = 'MX'
-    setup_channel: int = 6
-    idle_seconds: int = 300
-    connect_timeout: int = 45
-    retry_seconds: int = 60
-    admin_token: str = ''
-    state_file: str = '/var/lib/selfiq/credentials.json'
-    runtime_dir: str = '/run/selfiq'
-    tcp_port: int = 5000
-    backend_ws_url: str = ''
-    gateway_id: str = ''
-    gateway_token: str = ''
-    gateway_state_file: str = '/var/lib/selfiq/gateway.json'
+    sta_interface: str
+    ap_interface: str
+    virtual_ap: bool
+    ap_ip: str
+    ap_ssid: str
+    ap_password: str
+    country: str
+    setup_channel: int
+    idle_seconds: int
+    connect_timeout: int
+    retry_seconds: int
+    recovery_rounds: int
+    recovery_attempts: int
+    recovery_retry_seconds: int
+    offline_ap_delay: int
+    offline_db: str
+    offline_max_fraction: float
+    offline_reserve_fraction: float
+    offline_reserve_bytes: int
+    offline_max_payload: int
+    admin_token: str
+    state_file: str
+    runtime_dir: str
+    tcp_port: int
+    backend_ws_url: str
+    gateway_id: str
+    gateway_token: str
+    gateway_state_file: str
 
+    influx_url: str
+    influx_bucket: str
+    influx_org: str
+    influx_token: str
+
+    
     @classmethod
     def load(cls, path):
         settings = json.loads(Path(path).read_text())
@@ -98,6 +113,14 @@ class Config:
             raise ValueError('País incorrecto')
         if not 1 <= result.setup_channel <= 11 or result.idle_seconds < 1 or result.retry_seconds < 1:
             raise ValueError('Canal o tiempos incorrectos')
+        if not (0 < result.offline_max_fraction < 1 and
+                0 < result.offline_reserve_fraction < 1):
+            raise ValueError('Fracciones de almacenamiento invalidas')
+        if (min(result.recovery_rounds, result.recovery_attempts,
+                result.recovery_retry_seconds, result.offline_ap_delay,
+                result.offline_max_payload, result.connect_timeout) < 1
+                or result.offline_reserve_bytes < 0):
+            raise ValueError('Limites de recuperacion invalidos')
         Credentials(result.ap_ssid, result.ap_password).validate()
         if len(result.admin_token) < 32:
             raise ValueError('Falta token administrativo de al menos 32 caracteres')
