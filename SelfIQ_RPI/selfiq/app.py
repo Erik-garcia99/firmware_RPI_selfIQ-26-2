@@ -69,7 +69,7 @@ class TCPService:
                 pass
 
     async def reconcile(self):
-        wanted = self.ctrl.ap_wanted and self.ctrl.net.ap_healthy() and not self.ctrl.busy
+        wanted = self.ctrl.can_distribute()
         if wanted and self.server is None:
             self.server = await asyncio.start_server(self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port)
         elif not wanted:

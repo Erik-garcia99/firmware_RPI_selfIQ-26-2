@@ -32,6 +32,7 @@ class Controller:
         self.offline_since = None
         self.recovery_count = 0
         self.empty_ap_since = None
+        self.pairing_until = 0
 
     def touch(self):
         with self.lock:
@@ -95,6 +96,8 @@ class Controller:
             self.touch()
             if self.ap_wanted:
                 self._start_ap()
+            else:
+                self.net.stop_ap()
 
     def configure(self, creds):
         with self.lock:
@@ -114,10 +117,11 @@ class Controller:
                 self.net.enable_autoconnect(candidate)
                 self.external_wifi = False
                 self.error = ''
-                self.ap_wanted = True
+                self.ap_wanted = self.recovery_ap = False
+                self.pairing_until = 0
                 self.touch()
-                # AP can be enabled for ESP provisioning; does not touch STA.
-                self._start_ap()
+                # El emparejamiento se abre únicamente desde Agregar dispositivo.
+                self.net.stop_ap()
             except Exception as e:
                 self.error = str(e) if isinstance(e, RuntimeError) else 'Error al configurar; consulte logs'
                 log.exception('Configuración Wi-Fi incompleta')
@@ -179,7 +183,7 @@ class Controller:
                     elif now - self.empty_ap_since >= self.c.idle_seconds:
                         self.recovery_ap = self.ap_wanted = False
                         self.net.stop_ap()
-                elif self.ap_wanted and now - self.last_request >= self.c.idle_seconds:
+                elif self.ap_wanted and (now >= self.pairing_until or now - self.last_request >= self.c.idle_seconds):
                     self.net.stop_ap()
                     self.ap_wanted = False
             if self.ap_wanted and not self.net.ap_healthy():
@@ -191,6 +195,7 @@ class Controller:
                 raise ValueError('Wi-Fi o credenciales no disponibles para ESP32')
             self.online = True
             self.ap_wanted = True
+            self.pairing_until = self.clock() + 120
             self.touch()
             self._start_ap()
             if not self.net.ap_healthy():
@@ -199,6 +204,7 @@ class Controller:
 
     def stop_provisioning(self):
         with self.lock:
+            self.pairing_until = 0
             if self.recovery_ap:
                 raise ValueError('AP en recuperacion; espere a que salgan los clientes')
             self.ap_wanted = False
@@ -220,7 +226,8 @@ class Controller:
             self.net.stop_ap()
 
     def can_distribute(self):
-        return bool(not self.busy and self.ap_wanted and self.online and self.creds and self.net.ap_healthy())
+        return bool(not self.busy and self.clock() < self.pairing_until
+                    and self.ap_wanted and self.online and self.creds and self.net.ap_healthy())
 
     def status(self):
         return {'recovery_ap': self.recovery_ap, 'wifi_connected': self.online,
