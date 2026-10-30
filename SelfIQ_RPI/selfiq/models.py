@@ -74,10 +74,10 @@ class Config:
     gateway_token: str
     gateway_state_file: str
 
-    influx_url: str
-    influx_bucket: str
-    influx_org: str
-    influx_token: str
+    influx_url: str = ''
+    influx_bucket: str = ''
+    influx_org: str = ''
+    influx_token: str = ''
 
     
     @classmethod
