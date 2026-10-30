@@ -14,7 +14,6 @@ from .backend_link import BackendLink
 from .mqtt_bridge import MQTTBridge
 from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
-from .influx_sync import run_influx_sync
 
 
 log = logging.getLogger('selfiq')
@@ -91,7 +90,7 @@ def create_app(config, network=None):
     tcp = TCPService(ctrl)
     jobs = set()
 
-    async def execute(command):
+    async def execute(command, message=None):
         if command == 'status':
             # Backend receives operational state, never SSID/password/username.
             state = ctrl.status()
@@ -100,6 +99,10 @@ def create_app(config, network=None):
                     'backend_connected': backend.connected,
                     'storage_error': mqtt_bridge.storage_error,
                     'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
+        if command == 'light.test':
+            # Solo se confirma la entrega al broker local; el firmware actual
+            # del nodo todavía no acciona GPIO de luces.
+            return await asyncio.to_thread(mqtt_bridge.test_light, message or {})
         if ctrl.busy:
             raise ValueError('Configuración en curso')
         if not ctrl.online or not ctrl.creds:
@@ -143,7 +146,7 @@ def create_app(config, network=None):
                 log.exception('Fallo de supervisión')
             await asyncio.sleep(5)
 
-        @asynccontextmanager
+    @asynccontextmanager
     async def lifespan(app):
         await asyncio.to_thread(ctrl.bootstrap)
         await tcp.reconcile()
@@ -189,16 +192,7 @@ def create_app(config, network=None):
                 )
 
             await mqtt_bridge.stop()
-
-
             backend_task.cancel()
-
-            await asyncio.gather(
-                task,
-                backend_task,
-                return_exceptions=True,
-            )
-
 
             await asyncio.gather(
                 task,
@@ -212,13 +206,19 @@ def create_app(config, network=None):
                     return_exceptions=True,
                 )
 
-                await asyncio.gather(
-                    *tuple(jobs),
-                    return_exceptions=True,
-                )
-
             await tcp.close()
-            await asyncio.to_thread(ctrl.shutdown)    def peer(request):
+            await asyncio.to_thread(ctrl.shutdown)
+
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.controller = ctrl
+    app.state.tcp = tcp
+    app.state.backend = backend
+    app.state.mqtt_bridge = mqtt_bridge
+    app.state.execute_command = execute
+    session = secrets.token_urlsafe(32)
+    ap_subnet = ipaddress.ip_network(config.ap_ip + '/24', strict=False)
+
+    def peer(request):
         try:
             return ipaddress.ip_address(request.client.host)
         except (ValueError, AttributeError):

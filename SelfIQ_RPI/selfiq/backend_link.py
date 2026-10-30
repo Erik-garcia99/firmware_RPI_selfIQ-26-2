@@ -42,9 +42,9 @@ class BackendLink:
             return response
         response = {'type': 'result', 'id': identifier}
         try:
-            if command not in ('tcp.enable', 'tcp.disable', 'status'):
+            if command not in ('tcp.enable', 'tcp.disable', 'status', 'light.test'):
                 raise ValueError('Orden no permitida')
-            operation = asyncio.create_task(self.execute(command))
+            operation = asyncio.create_task(self.execute(command, message))
             try:
                 data = await asyncio.shield(operation)
             except asyncio.CancelledError:

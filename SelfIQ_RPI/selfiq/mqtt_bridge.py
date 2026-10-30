@@ -19,6 +19,8 @@ log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 REQUEST = 'selfiq/esp32_setup'
+NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
+NODE_TYPE_ALIASES = {'shelf_guide': 'guide', 'occupancy': 'access_counter', 'camera': 'shelf_cam'}
 
 
 class MQTTBridge:
@@ -56,6 +58,33 @@ class MQTTBridge:
             if response.status != 200:
                 raise RuntimeError('Backend devolvió respuesta inesperada')
             return json.loads(response.read(2048))
+
+    def test_light(self, message):
+        """Publica la prueba en el tópico de comandos del nodo (sin GPIO aún)."""
+        node_id = message.get('node_id')
+        branch_id = message.get('branch_id')
+        module = message.get('module') or 'shelf_monitor'
+        channel = message.get('channel')
+        duration_ms = message.get('duration_ms', 5000)
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or not isinstance(module, str) or not re.fullmatch(r'[a-z0-9_]{1,32}', module)
+                or not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel < 10
+                or not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+                or not 100 <= duration_ms <= 30000):
+            raise ValueError('Orden de prueba de luz inválida')
+        if not self.connected or self.client is None:
+            raise ValueError('MQTT local no conectado')
+        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+        payload = json.dumps({'type': 'light.test', 'channel': channel, 'duration_ms': duration_ms})
+        info = self.client.publish(topic, payload, qos=1, retain=False)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f'Publicación MQTT fallida rc={info.rc}')
+        info.wait_for_publish(timeout=10)
+        if not info.is_published():
+            raise RuntimeError('El broker no confirmó la publicación MQTT')
+        log.info('Prueba de luz publicada en %s (canal %s)', topic, channel)
+        return {'published': True, 'channel': channel, 'duration_ms': duration_ms}
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
@@ -114,7 +143,8 @@ class MQTTBridge:
                 node_type = value['node_type']
             else:
                 mac, node_type = raw.upper(), self.default_node_type
-            if not MAC_RE.fullmatch(mac) or node_type not in ('guide', 'access_counter', 'shelf_cam', 'environment'):
+            node_type = NODE_TYPE_ALIASES.get(node_type, node_type)
+            if not MAC_RE.fullmatch(mac) or node_type not in NODE_TYPES:
                 raise ValueError('Identificador incorrecto')
         except (ValueError, TypeError, KeyError, UnicodeDecodeError, AttributeError):
             log.warning('MQTT: solicitud de registro inválida')

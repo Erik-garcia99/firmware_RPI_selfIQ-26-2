@@ -153,7 +153,7 @@ class TLSLinkTests(unittest.IsolatedAsyncioTestCase):
                 ssl_certfile=str(path/'cert.pem'), ssl_keyfile=str(path/'key.pem')))
             server_task = asyncio.create_task(server.serve(sockets=[sock]))
             link_task = None
-            async def execute(command): return {'executed':command}
+            async def execute(command, message=None): return {'executed':command}
             config = replace(Config(), gateway_id='rpi-test', gateway_token='T'*32,
                 gateway_state_file=str(path/'gateway.json'),
                 backend_ws_url=f'https://127.0.0.1:{port}')
