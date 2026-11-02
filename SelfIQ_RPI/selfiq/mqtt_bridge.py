@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import time
+import threading
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -14,11 +15,14 @@ import paho.mqtt.client as mqtt
 
 from .backend_config import websocket_url
 from .outbox import Outbox, StorageFull
+from .node_control import reset_frame, parse_reset_result
 
 log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 REQUEST = 'selfiq/esp32_setup'
+NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
+NODE_TYPE_ALIASES = {'shelf_guide': 'guide', 'occupancy': 'access_counter', 'camera': 'shelf_cam'}
 
 
 class MQTTBridge:
@@ -33,14 +37,29 @@ class MQTTBridge:
         self.pending = set()
         self.outbox = None
         self.storage_error = ''
+        self.reset_waiters = {}
+        self.reset_lock = threading.Lock()
+        self.subscriptions_ready = threading.Event()
+        self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
 
-    def endpoint(self):
+    def _api_url(self, suffix):
         base = urlsplit(websocket_url(self.config.backend_ws_url))
         scheme = 'https' if base.scheme == 'wss' else 'http'
-        return urlunsplit((scheme, base.netloc,
-                           base.path.removesuffix('/ws/gateways') + '/gateways/'
-                           + quote(self.config.gateway_id, safe='') + '/nodes/register', '', ''))
+        prefix = (base.path.removesuffix('/ws/gateways') + '/gateways/'
+                  + quote(self.config.gateway_id, safe=''))
+        return urlunsplit((scheme, base.netloc, prefix + suffix, '', ''))
+
+    def endpoint(self):
+        return self._api_url('/nodes/register')
+
+    def _post_signed(self, url, payload):
+        request = Request(url, json.dumps(payload).encode(),
+                          {'Content-Type': 'application/json'}, method='POST')
+        with urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                raise RuntimeError('Backend devolvió respuesta inesperada')
+            return json.loads(response.read(2048))
 
     def _signed_post(self, mac, node_type):
         identity = self.backend.ensure_identity()
@@ -57,10 +76,93 @@ class MQTTBridge:
                 raise RuntimeError('Backend devolvió respuesta inesperada')
             return json.loads(response.read(2048))
 
+    def _signed_heartbeat(self, node_id):
+        identity = self.backend.ensure_identity()
+        timestamp = int(time.time())
+        nonce = secrets.token_urlsafe(18)
+        data = ('selfiq-node-heartbeat-v1\n' + self.config.gateway_id + '\n'
+                + str(timestamp) + '\n' + nonce + '\n' + node_id).encode()
+        payload = {'timestamp': timestamp, 'nonce': nonce,
+                   'signature': base64.b64encode(identity.key.sign(data)).decode()}
+        return self._post_signed(
+            self._api_url('/nodes/' + quote(node_id, safe='') + '/heartbeat'), payload)
+
+    async def _send_heartbeat(self, node_id):
+        try:
+            await asyncio.to_thread(self._signed_heartbeat, node_id)
+        except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
+            log.warning('Presencia de nodo %s no registrada (%s)', node_id, type(exc).__name__)
+        except Exception:
+            log.exception('Error inesperado al actualizar presencia de %s', node_id)
+
+    def _queue_heartbeat(self, node_id):
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._send_heartbeat(node_id)))
+
+    def test_light(self, message):
+        """Publica la prueba en el tópico de comandos del nodo (sin GPIO aún)."""
+        node_id = message.get('node_id')
+        branch_id = message.get('branch_id')
+        module = message.get('module') or 'shelf_monitor'
+        channel = message.get('channel')
+        duration_ms = message.get('duration_ms', 5000)
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or not isinstance(module, str) or not re.fullmatch(r'[a-z0-9_]{1,32}', module)
+                or not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel < 10
+                or not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+                or not 100 <= duration_ms <= 30000):
+            raise ValueError('Orden de prueba de luz inválida')
+        if not self.connected or self.client is None:
+            raise ValueError('MQTT local no conectado')
+        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+        payload = json.dumps({'type': 'light.test', 'channel': channel, 'duration_ms': duration_ms})
+        info = self.client.publish(topic, payload, qos=1, retain=False)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f'Publicación MQTT fallida rc={info.rc}')
+        info.wait_for_publish(timeout=10)
+        if not info.is_published():
+            raise RuntimeError('El broker no confirmó la publicación MQTT')
+        log.info('Prueba de luz publicada en %s (canal %s)', topic, channel)
+        return {'published': True, 'channel': channel, 'duration_ms': duration_ms}
+
+    def reset_node(self, message):
+        node_id, branch_id = message.get('node_id'), message.get('branch_id')
+        if not all(isinstance(value, str) and UUID_RE.fullmatch(value)
+                   for value in (node_id, branch_id)):
+            raise ValueError('Identidad del nodo inválida')
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo para recibir la confirmación del nodo')
+        topic = f'selfiq/{branch_id}/{node_id}/control'
+        waiter = {'event': threading.Event(), 'topic': topic + '/result', 'result': None}
+        with self.reset_lock:
+            if waiter['topic'] in self.reset_waiters:
+                raise ValueError('Ya hay un borrado pendiente para este nodo')
+            self.reset_waiters[waiter['topic']] = waiter
+        try:
+            log.info('Borrado de identidad solicitado: nodo=%s tópico=%s/command payload=01 03', node_id, topic)
+            info = self.client.publish(topic + '/command', reset_frame(), qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError('No se pudo enviar el restablecimiento')
+            if not waiter['event'].wait(20):
+                log.warning('Sin confirmación de borrado: nodo=%s tópico esperado=%s', node_id, waiter['topic'])
+                raise ValueError('El nodo no confirmó el borrado de identidad; comprueba que esté conectado y tenga firmware actualizado')
+            if waiter['result'] is not True:
+                raise ValueError('El nodo no pudo borrar su identidad de NVS')
+            log.info('Borrado de identidad confirmado por nodo=%s', node_id)
+            return {'identity_reset': True, 'node_id': node_id}
+        finally:
+            with self.reset_lock:
+                self.reset_waiters.pop(waiter['topic'], None)
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
-            result, _ = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1)])
+            self.subscriptions_ready.clear()
+            result, self.subscription_mid = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1),
+                                                              ('selfiq/+/+/+/status', 1),
+                                                              ('selfiq/+/+/control/result', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
             else:
@@ -73,16 +175,39 @@ class MQTTBridge:
             log.error('Broker rechazó suscripción a %s: %s', REQUEST, reason_codes)
             return
         log.info('MQTT: Raspberry suscrita a %s', REQUEST)
+        if mid == self.subscription_mid:
+            self.subscriptions_ready.set()
 
     def _on_connect_fail(self, client, userdata):
         log.warning('MQTT: no se pudo conectar a 127.0.0.1:1883; reintentando')
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
         self.connected = False
+        self.subscriptions_ready.clear()
         log.warning('MQTT broker desconectado: %s', reason_code)
 
     def _on_message(self, client, userdata, message):
         parts = message.topic.split('/')
+        if len(parts) == 5 and parts[3:] == ['control', 'result']:
+            if message.retain or len(message.payload) > 512:
+                return
+            try:
+                result = parse_reset_result(message.payload)
+                with self.reset_lock:
+                    waiter = self.reset_waiters.get(message.topic)
+                    if waiter and waiter['topic'] == message.topic:
+                        waiter['result'] = result
+                        waiter['event'].set()
+            except (ValueError, UnicodeError):
+                pass
+            return
+        if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'status':
+            if (not message.retain and message.payload == b'online'
+                    and parts[1] == (self.backend.branch_id or parts[1])
+                    and UUID_RE.fullmatch(parts[1]) and UUID_RE.fullmatch(parts[2])
+                    and re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
+                self._queue_heartbeat(parts[2])
+            return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
                     or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3]) or message.retain):
@@ -114,7 +239,8 @@ class MQTTBridge:
                 node_type = value['node_type']
             else:
                 mac, node_type = raw.upper(), self.default_node_type
-            if not MAC_RE.fullmatch(mac) or node_type not in ('guide', 'access_counter', 'shelf_cam', 'environment'):
+            node_type = NODE_TYPE_ALIASES.get(node_type, node_type)
+            if not MAC_RE.fullmatch(mac) or node_type not in NODE_TYPES:
                 raise ValueError('Identificador incorrecto')
         except (ValueError, TypeError, KeyError, UnicodeDecodeError, AttributeError):
             log.warning('MQTT: solicitud de registro inválida')

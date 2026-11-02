@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo 'Ejecute: sudo bash update_registration.sh'; exit 1; }
 task_source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ "$task_source_dir" != /opt/selfiq ]] || { echo 'Ejecute desde su carpeta de proyecto, fuera de /opt/selfiq.'; exit 1; }
-for name in __init__.py app.py models.py network.py controller.py protocol.py backend_link.py backend_config.py gateway_identity.py mqtt_bridge.py credential_integrity.py outbox.py index.html; do
+for name in __init__.py app.py models.py network.py controller.py protocol.py backend_link.py backend_config.py gateway_identity.py mqtt_bridge.py node_control.py credential_integrity.py outbox.py index.html; do
   [[ -f "$task_source_dir/selfiq/$name" ]] || { echo "Falta selfiq/$name. Aplique el parche sobre el proyecto RPi completo."; exit 1; }
 done
 [[ -x /opt/selfiq/.venv/bin/python ]] || { echo 'Falta la instalacion existente en /opt/selfiq.'; exit 1; }
