@@ -43,12 +43,23 @@ class MQTTBridge:
         self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
 
-    def endpoint(self):
+    def _api_url(self, suffix):
         base = urlsplit(websocket_url(self.config.backend_ws_url))
         scheme = 'https' if base.scheme == 'wss' else 'http'
-        return urlunsplit((scheme, base.netloc,
-                           base.path.removesuffix('/ws/gateways') + '/gateways/'
-                           + quote(self.config.gateway_id, safe='') + '/nodes/register', '', ''))
+        prefix = (base.path.removesuffix('/ws/gateways') + '/gateways/'
+                  + quote(self.config.gateway_id, safe=''))
+        return urlunsplit((scheme, base.netloc, prefix + suffix, '', ''))
+
+    def endpoint(self):
+        return self._api_url('/nodes/register')
+
+    def _post_signed(self, url, payload):
+        request = Request(url, json.dumps(payload).encode(),
+                          {'Content-Type': 'application/json'}, method='POST')
+        with urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                raise RuntimeError('Backend devolvió respuesta inesperada')
+            return json.loads(response.read(2048))
 
     def _signed_post(self, mac, node_type):
         identity = self.backend.ensure_identity()
@@ -64,6 +75,30 @@ class MQTTBridge:
             if response.status != 200:
                 raise RuntimeError('Backend devolvió respuesta inesperada')
             return json.loads(response.read(2048))
+
+    def _signed_heartbeat(self, node_id):
+        identity = self.backend.ensure_identity()
+        timestamp = int(time.time())
+        nonce = secrets.token_urlsafe(18)
+        data = ('selfiq-node-heartbeat-v1\n' + self.config.gateway_id + '\n'
+                + str(timestamp) + '\n' + nonce + '\n' + node_id).encode()
+        payload = {'timestamp': timestamp, 'nonce': nonce,
+                   'signature': base64.b64encode(identity.key.sign(data)).decode()}
+        return self._post_signed(
+            self._api_url('/nodes/' + quote(node_id, safe='') + '/heartbeat'), payload)
+
+    async def _send_heartbeat(self, node_id):
+        try:
+            await asyncio.to_thread(self._signed_heartbeat, node_id)
+        except (URLError, OSError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
+            log.warning('Presencia de nodo %s no registrada (%s)', node_id, type(exc).__name__)
+        except Exception:
+            log.exception('Error inesperado al actualizar presencia de %s', node_id)
+
+    def _queue_heartbeat(self, node_id):
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._send_heartbeat(node_id)))
 
     def test_light(self, message):
         """Publica la prueba en el tópico de comandos del nodo (sin GPIO aún)."""
@@ -106,13 +141,16 @@ class MQTTBridge:
                 raise ValueError('Ya hay un borrado pendiente para este nodo')
             self.reset_waiters[waiter['topic']] = waiter
         try:
+            log.info('Borrado de identidad solicitado: nodo=%s tópico=%s/command payload=01 03', node_id, topic)
             info = self.client.publish(topic + '/command', reset_frame(), qos=1, retain=False)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError('No se pudo enviar el restablecimiento')
             if not waiter['event'].wait(20):
+                log.warning('Sin confirmación de borrado: nodo=%s tópico esperado=%s', node_id, waiter['topic'])
                 raise ValueError('El nodo no confirmó el borrado de identidad; comprueba que esté conectado y tenga firmware actualizado')
             if waiter['result'] is not True:
                 raise ValueError('El nodo no pudo borrar su identidad de NVS')
+            log.info('Borrado de identidad confirmado por nodo=%s', node_id)
             return {'identity_reset': True, 'node_id': node_id}
         finally:
             with self.reset_lock:
@@ -123,6 +161,7 @@ class MQTTBridge:
         if self.connected:
             self.subscriptions_ready.clear()
             result, self.subscription_mid = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1),
+                                                              ('selfiq/+/+/+/status', 1),
                                                               ('selfiq/+/+/control/result', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
@@ -161,6 +200,13 @@ class MQTTBridge:
                         waiter['event'].set()
             except (ValueError, UnicodeError):
                 pass
+            return
+        if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'status':
+            if (not message.retain and message.payload == b'online'
+                    and parts[1] == (self.backend.branch_id or parts[1])
+                    and UUID_RE.fullmatch(parts[1]) and UUID_RE.fullmatch(parts[2])
+                    and re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
+                self._queue_heartbeat(parts[2])
             return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
