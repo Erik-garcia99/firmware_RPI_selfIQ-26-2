@@ -230,19 +230,26 @@ def create_app(config, network=None):
         if not secrets.compare_digest(request.headers.get('x-selfiq-token', ''), config.admin_token):
             raise HTTPException(403, 'Token administrativo requerido')
 
+    # Rutas que el ESP32 puede llamar sin token admin (red local).
+    CAMERA_PATHS = {'/camera/snapshot'}
+
     @app.middleware('http')
     async def restrict(request, call_next):
         try:
             address = peer(request)
-            if not address.is_loopback and not (address in ap_subnet and ctrl.net.ap_healthy()):
+            if not address.is_loopback and not (address in ap_subnet and ctrl.net.ap_healthy()) \
+                    and request.url.path not in CAMERA_PATHS:
                 admin(request)
             # No CORS. Block cross-site form/fetch submissions and DNS rebinding.
             if request.method != 'GET':
                 host = request.headers.get('host', '')
-                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable', '/admin/tcp/disable', '/admin/backend/configure'):
+                if (host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost')
+                        and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable',
+                                                    '/admin/tcp/disable', '/admin/backend/configure')
+                        and request.url.path not in CAMERA_PATHS):
                     raise HTTPException(403, 'Host no permitido')
                 origin = request.headers.get('origin')
-                if origin and origin != 'http://' + host:
+                if origin and origin != 'http://' + host and request.url.path not in CAMERA_PATHS:
                     raise HTTPException(403, 'Origen no permitido')
             response = await call_next(request)
         except HTTPException as exc:
@@ -276,6 +283,39 @@ def create_app(config, network=None):
                 'gateway_id': config.gateway_id, 'branch_id': backend.branch_id,
                 'registration_status': backend.registration_status,
                 'registration_alert': 'Corrija el token de sucursal' if backend.registration_status in ('token_invalid', 'registration_rejected') else None}
+
+    # Almacenamiento en memoria de la ultima imagen por nodo.
+    _snapshots = {}
+
+    @app.post('/camera/snapshot')
+    async def receive_snapshot(request: Request):
+        node_id = request.headers.get('x-node-id', '')
+        branch_id = request.headers.get('x-branch-id', '')
+        req_id = request.headers.get('x-req-id', '')
+        if not node_id:
+            raise HTTPException(400, 'Falta X-Node-Id')
+        raw = await request.body()
+        if not raw or len(raw) > 200000:
+            raise HTTPException(413, 'Imagen demasiado grande o vacia')
+        _snapshots[node_id] = {
+            'data': raw,
+            'req_id': req_id,
+            'branch_id': branch_id,
+            'received_at': __import__('time').time(),
+        }
+        log.info('Snapshot recibido: nodo=%s req=%s bytes=%d', node_id, req_id, len(raw))
+        return {'ok': True, 'bytes': len(raw), 'req_id': req_id}
+
+    @app.get('/camera/snapshot')
+    async def get_snapshot(request: Request):
+        node_id = request.query_params.get('node_id', '')
+        if not node_id or node_id not in _snapshots:
+            raise HTTPException(404, 'Sin imagen para este nodo')
+        snap = _snapshots[node_id]
+        from fastapi.responses import Response as RawResponse
+        return RawResponse(content=snap['data'], media_type='image/jpeg',
+                           headers={'X-Received-At': str(snap['received_at']),
+                                    'X-Req-Id': snap['req_id']})
 
     @app.post('/configure', status_code=202)
     async def configure(request: Request):
