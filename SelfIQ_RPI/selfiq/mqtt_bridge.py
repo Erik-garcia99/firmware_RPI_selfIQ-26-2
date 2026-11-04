@@ -156,6 +156,52 @@ class MQTTBridge:
             with self.reset_lock:
                 self.reset_waiters.pop(waiter['topic'], None)
 
+    # --- Snapshot bajo demanda ---
+    _snapshot_waiters = {}
+    _snapshot_lock = threading.Lock()
+
+    def request_snapshot(self, message):
+        node_id = message.get('node_id')
+        branch_id = message.get('branch_id')
+        module = message.get('module') or 'shelf_cam'
+        req_id = message.get('req_id') or ('snap-' + secrets.token_hex(4))
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or not isinstance(module, str) or not re.fullmatch(r'[a-z0-9_]{1,32}', module)):
+            raise ValueError('Identidad del nodo inválida')
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo')
+        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+        waiter = {'event': threading.Event(), 'req_id': req_id, 'result': None}
+        with self._snapshot_lock:
+            self._snapshot_waiters[req_id] = waiter
+        try:
+            payload = json.dumps({'type': 'snapshot.request', 'req_id': req_id})
+            log.info('Snapshot solicitado: nodo=%s req=%s tópico=%s', node_id, req_id, topic)
+            info = self.client.publish(topic, payload, qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError('No se pudo publicar snapshot.request')
+            info.wait_for_publish(timeout=10)
+            if not waiter['event'].wait(15):
+                log.warning('Sin imagen del nodo=%s req=%s (tópico=%s)', node_id, req_id, topic)
+                raise ValueError('El nodo no envió la imagen a tiempo')
+            if waiter['result'] is not True:
+                raise ValueError('El nodo no pudo capturar la imagen')
+            log.info('Snapshot confirmado por nodo=%s req=%s', node_id, req_id)
+            return {'snapshot': True, 'node_id': node_id, 'req_id': req_id}
+        finally:
+            with self._snapshot_lock:
+                self._snapshot_waiters.pop(req_id, None)
+
+    def notify_snapshot(self, node_id, req_id):
+        with self._snapshot_lock:
+            waiter = self._snapshot_waiters.get(req_id)
+            if waiter:
+                waiter['result'] = True
+                waiter['event'].set()
+                return True
+        return False
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:

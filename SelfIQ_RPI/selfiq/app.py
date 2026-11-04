@@ -101,6 +101,8 @@ def create_app(config, network=None):
                     'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
         if command == 'node.reset':
             return await asyncio.to_thread(mqtt_bridge.reset_node, message or {})
+        if command == 'snapshot.request':
+            return await asyncio.to_thread(mqtt_bridge.request_snapshot, message or {})
         if command == 'light.test':
             # Solo se confirma la entrega al broker local; el firmware actual
             # del nodo todavía no acciona GPIO de luces.
@@ -304,6 +306,45 @@ def create_app(config, network=None):
             'received_at': __import__('time').time(),
         }
         log.info('Snapshot recibido: nodo=%s req=%s bytes=%d', node_id, req_id, len(raw))
+        # Notificar al waiter del comando snapshot.request
+        if req_id:
+            mqtt_bridge.notify_snapshot(node_id, req_id)
+
+        # Reenviar al backend firmado (Ed25519) en segundo plano.
+        async def _forward():
+            try:
+                if not backend.connected:
+                    log.warning('Snapshot no reenviado: backend desconectado')
+                    return
+                identity = backend.ensure_identity()
+                import time as _t, secrets as _s, base64 as _b64, hashlib as _hl
+                from urllib.request import Request as _Req, urlopen as _urlopen
+                from urllib.parse import urlsplit, urlunsplit, quote as _quote
+                ts = int(_t.time())
+                nonce = _s.token_urlsafe(18)
+                img_hash = _hl.sha256(raw).hexdigest()
+                data = (f'selfiq-snapshot-v1\\n{config.gateway_id}\\n{ts}\\n{nonce}\\n{node_id}\\n{img_hash}').encode()
+                sig = _b64.b64encode(identity.key.sign(data)).decode()
+                base = urlsplit(websocket_url(config.backend_ws_url))
+                scheme = 'https' if base.scheme == 'wss' else 'http'
+                prefix = (base.path.removesuffix('/ws/gateways') + '/gateways/'
+                          + _quote(config.gateway_id, safe=''))
+                url = urlunsplit((scheme, base.netloc, prefix + '/devices/' + _quote(node_id, safe='') + '/snapshot', '', ''))
+                req = _Req(url, data=raw, headers={
+                    'Content-Type': 'image/jpeg',
+                    'X-Timestamp': str(ts),
+                    'X-Nonce': nonce,
+                    'X-Signature': sig,
+                    'X-Gateway-Id': config.gateway_id,
+                }, method='POST')
+                with _urlopen(req, timeout=15) as resp:
+                    log.info('Snapshot reenviado al backend: %s (HTTP %s)', node_id, resp.status)
+            except Exception as exc:
+                log.warning('No se pudo reenviar snapshot al backend: %s', type(exc).__name__)
+
+        import asyncio as _asyncio
+        _asyncio.create_task(_forward())
+
         return {'ok': True, 'bytes': len(raw), 'req_id': req_id}
 
     @app.get('/camera/snapshot')
