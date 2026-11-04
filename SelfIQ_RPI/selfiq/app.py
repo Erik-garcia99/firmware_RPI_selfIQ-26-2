@@ -11,6 +11,7 @@ from .models import Config, Credentials
 from .network import Network
 from .controller import Controller
 from .backend_link import BackendLink
+from .backend_config import websocket_url
 from .mqtt_bridge import MQTTBridge
 from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
@@ -340,7 +341,8 @@ def create_app(config, network=None):
                 with _urlopen(req, timeout=15) as resp:
                     log.info('Snapshot reenviado al backend: %s (HTTP %s)', node_id, resp.status)
             except Exception as exc:
-                log.warning('No se pudo reenviar snapshot al backend: %s', type(exc).__name__)
+                log.warning('No se pudo reenviar snapshot al backend: %s: %s',
+                            type(exc).__name__, exc)
 
         import asyncio as _asyncio
         _asyncio.create_task(_forward())
