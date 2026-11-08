@@ -104,6 +104,8 @@ def create_app(config, network=None):
             return await asyncio.to_thread(mqtt_bridge.reset_node, message or {})
         if command == 'snapshot.request':
             return await asyncio.to_thread(mqtt_bridge.request_snapshot, message or {})
+        if command == 'roi.set':
+            return await asyncio.to_thread(mqtt_bridge.set_rois, message or {})
         if command == 'light.test':
             # Solo se confirma la entrega al broker local; el firmware actual
             # del nodo todavía no acciona GPIO de luces.

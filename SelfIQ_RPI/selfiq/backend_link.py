@@ -42,7 +42,8 @@ class BackendLink:
             return response
         response = {'type': 'result', 'id': identifier}
         try:
-            if command not in ('tcp.enable', 'tcp.disable', 'status', 'light.test', 'node.reset', 'snapshot.request'):
+            if command not in ('tcp.enable', 'tcp.disable', 'status', 'light.test',
+                               'node.reset', 'snapshot.request', 'roi.set'):
                 raise ValueError('Orden no permitida')
             operation = asyncio.create_task(self.execute(command, message))
             try:

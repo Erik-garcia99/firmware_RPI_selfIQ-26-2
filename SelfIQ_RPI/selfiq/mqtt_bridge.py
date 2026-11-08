@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -39,6 +40,8 @@ class MQTTBridge:
         self.storage_error = ''
         self.reset_waiters = {}
         self.reset_lock = threading.Lock()
+        self._roi_waiters = {}
+        self._roi_lock = threading.Lock()
         self.subscriptions_ready = threading.Event()
         self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
@@ -202,12 +205,109 @@ class MQTTBridge:
                 return True
         return False
 
+    # --- Aplicación de ROI (roi.set + ACK) ---
+    ROI_MODULE = 'shelf_cam'
+    ROI_REQ_RE = re.compile(r'[A-Za-z0-9._:-]{1,64}')
+
+    def set_rois(self, message):
+        node_id = message.get('node_id')
+        branch_id = message.get('branch_id')
+        module = message.get('module') or self.ROI_MODULE
+        req_id = message.get('req_id')
+        version = message.get('version')
+        rois = message.get('rois')
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or module != self.ROI_MODULE):
+            raise ValueError('Identidad del nodo o módulo inválido')
+        if not isinstance(req_id, str) or not self.ROI_REQ_RE.fullmatch(req_id):
+            raise ValueError('req_id inválido')
+        if not isinstance(version, int) or isinstance(version, bool) or not 0 <= version <= 2**31 - 1:
+            raise ValueError('Versión de zonas inválida')
+        if not isinstance(rois, list):
+            raise ValueError('Lista de zonas inválida')
+        for roi in rois:
+            if not isinstance(roi, dict) or not isinstance(roi.get('id'), str) or not roi['id']:
+                raise ValueError('Zona inválida en la orden')
+            for key in ('x', 'y', 'w', 'h'):
+                value = roi.get(key)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value)):
+                    raise ValueError('Zona inválida en la orden')
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo para aplicar zonas')
+
+        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+        waiter = {'event': threading.Event(), 'req_id': req_id, 'result': None}
+        with self._roi_lock:
+            if req_id in self._roi_waiters:
+                raise ValueError('Ya hay una aplicación pendiente con ese req_id')
+            self._roi_waiters[req_id] = waiter
+        started = time.monotonic()
+        try:
+            payload = json.dumps({'type': 'roi.set', 'req_id': req_id,
+                                  'version': version, 'rois': rois},
+                                 separators=(',', ':'))
+            log.info('ROI set solicitado: nodo=%s req=%s version=%s count=%d',
+                     node_id, req_id, version, len(rois))
+            info = self.client.publish(topic, payload, qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError('No se pudo publicar roi.set')
+            info.wait_for_publish(timeout=10)
+            if not waiter['event'].wait(15):
+                log.warning('ROI set sin ACK: nodo=%s req=%s timeout=15s', node_id, req_id)
+                raise ValueError('Sin ACK del nodo (timeout 15s)')
+            result = waiter['result']
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if not result or result.get('ok') is not True:
+                error = (result or {}).get('error') or 'El nodo rechazó las zonas'
+                log.warning('ROI set rechazado: nodo=%s req=%s error=%s',
+                            node_id, req_id, error)
+                raise ValueError(error)
+            ack_version = result.get('version')
+            if not isinstance(ack_version, int) or isinstance(ack_version, bool):
+                ack_version = version
+            ack_count = result.get('count')
+            if not isinstance(ack_count, int) or isinstance(ack_count, bool):
+                ack_count = len(rois)
+            log.info('ROI set confirmado: nodo=%s req=%s version=%s count=%s duracion_ms=%d',
+                     node_id, req_id, ack_version, ack_count, duration_ms)
+            return {'rois': True, 'ok': True, 'version': ack_version,
+                    'count': ack_count, 'req_id': req_id}
+        finally:
+            with self._roi_lock:
+                self._roi_waiters.pop(req_id, None)
+
+    def notify_roi_ack(self, payload):
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            try:
+                payload = json.loads(bytes(payload))
+            except (TypeError, ValueError):
+                return False
+        if not isinstance(payload, dict) or payload.get('type') != 'roi_ack':
+            return False
+        req_id = payload.get('req_id')
+        if not isinstance(req_id, str):
+            return False
+        with self._roi_lock:
+            waiter = self._roi_waiters.get(req_id)
+            if not waiter:
+                return False
+            waiter['result'] = {'ok': payload.get('ok') is True,
+                                'version': payload.get('version'),
+                                'count': payload.get('count'),
+                                'error': (payload.get('error')
+                                          if isinstance(payload.get('error'), str) else None)}
+            waiter['event'].set()
+            return True
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
             self.subscriptions_ready.clear()
             result, self.subscription_mid = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1),
                                                               ('selfiq/+/+/+/status', 1),
+                                                              ('selfiq/+/+/+/command/ack', 1),
                                                               ('selfiq/+/+/control/result', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
@@ -253,6 +353,20 @@ class MQTTBridge:
                     and UUID_RE.fullmatch(parts[1]) and UUID_RE.fullmatch(parts[2])
                     and re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
                 self._queue_heartbeat(parts[2])
+            return
+        if len(parts) == 6 and parts[0] == 'selfiq' and parts[4:] == ['command', 'ack']:
+            if message.retain or len(message.payload) > 1024:
+                log.warning('ROI ACK descartado: retained o demasiado grande')
+                return
+            if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
+                    or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
+                log.warning('ROI ACK descartado: tópico inválido')
+                return
+            expected_branch = getattr(self.backend, 'branch_id', None)
+            if expected_branch and parts[1] != expected_branch:
+                log.warning('ROI ACK descartado: sucursal distinta')
+                return
+            self.notify_roi_ack(message.payload)
             return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
