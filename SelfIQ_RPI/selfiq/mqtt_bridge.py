@@ -224,7 +224,7 @@ class MQTTBridge:
             raise ValueError('req_id inválido')
         if not isinstance(version, int) or isinstance(version, bool) or not 0 <= version <= 2**31 - 1:
             raise ValueError('Versión de zonas inválida')
-        if not isinstance(rois, list) or not rois:
+        if not isinstance(rois, list):
             raise ValueError('Lista de zonas inválida')
         for roi in rois:
             if not isinstance(roi, dict) or not isinstance(roi.get('id'), str) or not roi['id']:

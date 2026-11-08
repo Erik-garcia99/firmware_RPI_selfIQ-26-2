@@ -86,7 +86,7 @@ class RoiCommandTests(unittest.TestCase):
 
     def test_rejects_invalid_module_and_payload(self):
         for change in ({'module': 'guide'}, {'module': 'bad module'}, {'req_id': ''},
-                       {'version': True}, {'rois': 'x'}, {'rois': []},
+                       {'version': True}, {'rois': 'x'},
                        {'rois': [{'id': 'r', 'x': 'a', 'y': 0, 'w': 0, 'h': 0}]}):
             with self.subTest(change=change):
                 with self.assertRaises(ValueError):
