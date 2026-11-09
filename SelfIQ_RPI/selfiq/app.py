@@ -92,6 +92,15 @@ def create_app(config, network=None):
     jobs = set()
 
     async def execute(command, message=None):
+        if command in {'snapshot.request', 'roi.set', 'light.test'}:
+            body = message or {}
+            try:
+                registered_at = await asyncio.to_thread(
+                    mqtt_bridge.authorize_node, body.get('branch_id'), body.get('node_id'))
+            except Exception:
+                raise ValueError('No se pudo verificar el registro del nodo') from None
+            if registered_at is None:
+                raise ValueError('Nodo no confirmado en el sistema')
         if command == 'status':
             # Backend receives operational state, never SSID/password/username.
             state = ctrl.status()
@@ -170,6 +179,7 @@ def create_app(config, network=None):
                     config,
                     mqtt_bridge.outbox,
                     influx_stop,
+                    mqtt_bridge.authorize_node,
                 ),
                 name="selfiq-influx-sync",
             )
@@ -299,6 +309,12 @@ def create_app(config, network=None):
         req_id = request.headers.get('x-req-id', '')
         if not node_id:
             raise HTTPException(400, 'Falta X-Node-Id')
+        try:
+            registered_at = await asyncio.to_thread(mqtt_bridge.authorize_node, branch_id, node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
         raw = await request.body()
         if not raw or len(raw) > 200000:
             raise HTTPException(413, 'Imagen demasiado grande o vacia')
@@ -318,6 +334,9 @@ def create_app(config, network=None):
             try:
                 if not backend.connected:
                     log.warning('Snapshot no reenviado: backend desconectado')
+                    return
+                if await asyncio.to_thread(mqtt_bridge.authorize_node, branch_id, node_id) is None:
+                    log.warning('Snapshot no reenviado: nodo no autorizado')
                     return
                 identity = backend.ensure_identity()
                 import time as _t, secrets as _s, base64 as _b64, hashlib as _hl
@@ -357,6 +376,14 @@ def create_app(config, network=None):
         if not node_id or node_id not in _snapshots:
             raise HTTPException(404, 'Sin imagen para este nodo')
         snap = _snapshots[node_id]
+        try:
+            registered_at = await asyncio.to_thread(
+                mqtt_bridge.authorize_node, snap['branch_id'], node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            _snapshots.pop(node_id, None)
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
         from fastapi.responses import Response as RawResponse
         return RawResponse(content=snap['data'], media_type='image/jpeg',
                            headers={'X-Received-At': str(snap['received_at']),

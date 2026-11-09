@@ -45,7 +45,6 @@ class MQTTBridge:
         self.subscriptions_ready = threading.Event()
         self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
-        self.registered_nodes = set()  # esp_id de nodos registrados en el sistema
 
     def _api_url(self, suffix):
         base = urlsplit(websocket_url(self.config.backend_ws_url))
@@ -90,6 +89,38 @@ class MQTTBridge:
                    'signature': base64.b64encode(identity.key.sign(data)).decode()}
         return self._post_signed(
             self._api_url('/nodes/' + quote(node_id, safe='') + '/heartbeat'), payload)
+
+    def authorize_node(self, branch_id, node_id):
+        """Consulta vigente, sin caché permisiva ni actualización de presencia.
+
+        None significa rechazo explícito. Errores de red/autenticación propagan
+        para conservar la cola y bloquear el envío, nunca autorizar por defecto.
+        """
+        if not all(isinstance(v, str) and UUID_RE.fullmatch(v) for v in (branch_id, node_id)):
+            return None
+        if not self.backend.connected or self.backend.registration_status != 'registered':
+            raise RuntimeError('Gateway sin autorización vigente')
+        if branch_id != self.backend.branch_id:
+            return None
+        timestamp = int(time.time())
+        nonce = secrets.token_urlsafe(18)
+        data = (f'selfiq-node-authorize-v1\n{self.config.gateway_id}\n'
+                f'{timestamp}\n{nonce}\n{node_id}').encode()
+        payload = {'timestamp': timestamp, 'nonce': nonce,
+                   'signature': base64.b64encode(self.backend.ensure_identity().key.sign(data)).decode()}
+        response = self._post_signed(
+            self._api_url('/nodes/' + quote(node_id, safe='') + '/authorize'), payload)
+        if (not isinstance(response, dict) or response.get('id') != node_id
+                or response.get('branch_id') != branch_id
+                or not isinstance(response.get('authorized'), bool)):
+            raise ValueError('Respuesta de autorización inválida')
+        if not response['authorized']:
+            return None
+        registered_at = response.get('registered_at')
+        if (isinstance(registered_at, bool) or not isinstance(registered_at, (int, float))
+                or not math.isfinite(registered_at)):
+            raise ValueError('Fecha de registro inválida')
+        return registered_at
 
     async def _send_heartbeat(self, node_id):
         try:
@@ -374,17 +405,13 @@ class MQTTBridge:
                     or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3]) or message.retain):
                 log.warning('[STORAGE] Telemetria/topico invalido o retained; sin ACK')
                 return
-            # Solo se almacenan/envían datos de nodos registrados en el sistema.
-            # La RPi puede recibirlos localmente, pero no los reenvía a la nube
-            # si el nodo no está registrado (sin identificador válido).
+            # Recepción local solamente. El envío cloud exige autorización REST
+            # vigente en influx_sync, también para eventos previos al reinicio.
             branch_id = parts[1]
             esp_id = parts[2]
             expected_branch = getattr(self.backend, 'branch_id', None)
             if expected_branch and branch_id != expected_branch:
                 log.warning('[STORAGE] Telemetria de sucursal no registrada; sin ACK')
-                return
-            if self.registered_nodes and esp_id not in self.registered_nodes:
-                log.warning('[STORAGE] Nodo no registrado en el sistema; sin ACK')
                 return
             if self.outbox is None:
                 log.error('[STORAGE] STORAGE_UNAVAILABLE; sin ACK')
@@ -448,7 +475,6 @@ class MQTTBridge:
                 info = self.client.publish(topic, payload, qos=1, retain=False)
                 if info.rc != mqtt.MQTT_ERR_SUCCESS:
                     raise RuntimeError(f'Publicación MQTT fallida rc={info.rc}')
-                self.registered_nodes.add(esp_id)
                 log.info('ESP32 registrada: %s -> %s (sucursal %s)', mac, esp_id, branch_id)
             except HTTPError as exc:
                 detail = ''
