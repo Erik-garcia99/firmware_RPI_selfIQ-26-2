@@ -17,6 +17,18 @@ import paho.mqtt.client as mqtt
 from .backend_config import websocket_url
 from .outbox import Outbox, StorageFull
 from .node_control import reset_frame, parse_reset_result
+from .calibration import (
+    CalibrationCommandError,
+    CalibrationStore,
+    ReferenceSpoolFull,
+    calibration_store_path,
+    command_action,
+    command_fingerprint,
+    parse_reference_meta,
+    validate_ack,
+    validate_command,
+    WAIT_SECONDS as CALIBRATION_WAIT_SECONDS,
+)
 
 log = logging.getLogger('selfiq.mqtt')
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
@@ -42,6 +54,11 @@ class MQTTBridge:
         self.reset_lock = threading.Lock()
         self._roi_waiters = {}
         self._roi_lock = threading.Lock()
+        self.cal_store = None
+        self._cal_waiters = {}
+        self._cal_lock = threading.Lock()
+        self._cal_store_lock = threading.Lock()
+        self._calibration_worker = None
         self.subscriptions_ready = threading.Event()
         self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
@@ -333,6 +350,239 @@ class MQTTBridge:
             waiter['event'].set()
             return True
 
+    # --- Calibración de zonas (Fase 4) ---
+    def _ensure_cal_store(self):
+        with self._cal_store_lock:
+            if self.cal_store is None:
+                try:
+                    self.cal_store = CalibrationStore(
+                        calibration_store_path(self.config))
+                except Exception:
+                    log.exception('No se pudo abrir el almacén de calibración')
+                    raise CalibrationCommandError(
+                        'gateway_offline',
+                        'Almacenamiento durable de calibración no disponible') from None
+            return self.cal_store
+
+    def run_calibration(self, command):
+        """Valida, publica y espera el ``cal_result`` de una orden de calibración."""
+        command = validate_command(command)
+        store = self._ensure_cal_store()
+        fingerprint = command_fingerprint(command)
+        existing = store.operation(command['id'])
+        if existing:
+            if existing['command_hash'] != fingerprint:
+                raise CalibrationCommandError(
+                    'operation_conflict',
+                    'El operation_id ya existe con otro cuerpo')
+            if existing['result']:
+                replay = json.loads(existing['result'])
+                replay['req_id'] = command['req_id']
+                log.info('Resultado durable reutilizado: operation=%s action=%s req=%s',
+                         command['id'], command_action(command), command['req_id'])
+                return replay
+            raise CalibrationCommandError(
+                'operation_conflict',
+                'El resultado previo es desconocido; consulte calibration.status')
+        store.begin_operation(command, fingerprint)
+
+        if not self.connected or self.client is None:
+            store.operation_status(command['id'], 'unknown')
+            raise CalibrationCommandError('node_timeout', 'MQTT local no conectado')
+        if not self.subscriptions_ready.wait(5):
+            store.operation_status(command['id'], 'unknown')
+            raise CalibrationCommandError(
+                'node_timeout', 'MQTT no está listo para recibir el ACK')
+
+        topic = (f"selfiq/{command['branch_id']}/{command['node_id']}"
+                 f"/shelf_cam/command")
+        waiter = {'event': threading.Event(), 'req_id': command['req_id'],
+                  'command': command, 'ack': None, 'error': None}
+        with self._cal_lock:
+            if command['req_id'] in self._cal_waiters:
+                raise CalibrationCommandError(
+                    'busy', 'Ya hay una calibración pendiente con ese req_id')
+            self._cal_waiters[command['req_id']] = waiter
+        deadline = time.monotonic() + CALIBRATION_WAIT_SECONDS
+        try:
+            wire_command = {key: value for key, value in command.items()
+                            if not key.startswith('_')}
+            payload = json.dumps(wire_command, separators=(',', ':'))
+            info = self.client.publish(topic, payload, qos=1, retain=False)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                store.operation_status(command['id'], 'unknown')
+                raise CalibrationCommandError(
+                    'node_timeout', 'No se pudo publicar la orden de calibración')
+            remaining = max(0, deadline - time.monotonic())
+            info.wait_for_publish(timeout=min(2, remaining))
+            store.operation_status(command['id'], 'sent')
+            remaining = max(0, deadline - time.monotonic())
+            if not waiter['event'].wait(remaining):
+                store.operation_status(command['id'], 'unknown')
+                if waiter['error']:
+                    raise CalibrationCommandError('invalid_ack', waiter['error'])
+                raise CalibrationCommandError(
+                    'node_timeout', 'Sin ACK del nodo (timeout 10s)')
+            ack = waiter['ack']
+            store.complete_operation(command['id'], ack)
+            log.info('Calibración confirmada: operation=%s action=%s req=%s',
+                     command['id'], command_action(command), command['req_id'])
+            return ack
+        finally:
+            with self._cal_lock:
+                self._cal_waiters.pop(command['req_id'], None)
+
+    def notify_cal_result(self, payload, branch_id, node_id, module):
+        """Entrega un ``cal_result`` solo a su waiter y tras validarlo completo."""
+        if module != 'shelf_cam' or not isinstance(payload, dict):
+            return False
+        if payload.get('type') != 'cal_result':
+            return False
+        req_id = payload.get('req_id')
+        if not isinstance(req_id, str):
+            return False
+        with self._cal_lock:
+            waiter = self._cal_waiters.get(req_id)
+            if not waiter:
+                return False
+            command = waiter['command']
+            if branch_id != command['branch_id'] or node_id != command['node_id']:
+                log.warning('cal_result descartado: tópico no corresponde a la operación')
+                return False
+            try:
+                validate_ack(command, payload)
+            except CalibrationCommandError as exc:
+                waiter['error'] = exc.detail
+                log.warning('cal_result invalidado: operation=%s motivo=%s',
+                            command['id'], exc.detail)
+                return False
+            waiter['ack'] = payload
+            waiter['event'].set()
+            return True
+
+    def accept_calibration_reference(self, node_id, branch_id, meta, raw):
+        """Correlaciona una referencia con su operación de captura y la encola."""
+        store = self._ensure_cal_store()
+        meta = parse_reference_meta(meta, raw)
+        operation = store.capture_operation(meta['capture_id'])
+        if not operation:
+            raise CalibrationCommandError(
+                'calibration_not_found', 'No hay una captura pendiente para esa imagen')
+        expected = (
+            ('branch_id', branch_id), ('node_id', node_id),
+            ('calibration_id', meta['calibration_id']), ('roi_id', meta['roi_id']),
+            ('kind', meta['kind']), ('context_hash', meta['context_hash']),
+            ('calibration_version', meta['calibration_version']),
+            ('format_version', meta['format_version']),
+        )
+        for field, value in expected:
+            if operation.get(field) != value:
+                raise CalibrationCommandError(
+                    'operation_conflict',
+                    f'La referencia no coincide con la captura ({field})')
+        meta['_node_id'] = node_id
+        meta['_branch_id'] = branch_id
+        try:
+            state, reference = store.put_reference(meta, raw)
+        except ReferenceSpoolFull:
+            raise CalibrationCommandError(
+                'storage_full', 'Spool de referencias lleno; reintente más tarde') from None
+        log.info('Referencia de calibración recibida: capture=%s estado=%s bytes=%d',
+                 meta['capture_id'], state, len(raw))
+        return state, reference
+
+    def flush_calibration_reference(self, capture_id):
+        store = self.cal_store
+        if store is None:
+            return
+        reference = store.reference(capture_id)
+        if reference and reference.get('image'):
+            self._upload_reference(reference)
+
+    def _upload_reference(self, reference):
+        store = self.cal_store
+        if store is None:
+            return
+        try:
+            meta = json.loads(reference['meta'])
+            raw = reference['image']
+            if not raw:
+                return
+            result = self._post_calibration_reference(
+                reference['node_id'], reference['branch_id'], meta, raw)
+            if not isinstance(result, dict) or result.get('ok') is not True:
+                raise ValueError('Respuesta de referencia inválida')
+            store.mark_reference_uploaded(reference['capture_id'])
+            log.info('Referencia reenviada al backend: capture=%s replay=%s',
+                     reference['capture_id'], bool(result.get('replay')))
+        except HTTPError as exc:
+            status = exc.code
+            detail = ''
+            try:
+                body = json.loads(exc.read(2048))
+                if isinstance(body, dict):
+                    detail = str(body.get('detail') or body.get('code') or '')[:200]
+            except (ValueError, OSError):
+                pass
+            if status == 409:
+                store.mark_reference_terminal(reference['capture_id'], 'conflict', detail or 'conflict')
+            elif status in (408, 429) or status >= 500:
+                delay = min(300, 5 * 2 ** min(int(reference.get('attempts') or 0), 6))
+                store.mark_reference_retry(reference['capture_id'],
+                                           f'HTTP {status} {detail}', delay)
+            else:
+                store.mark_reference_terminal(reference['capture_id'], 'failed',
+                                              f'HTTP {status} {detail}')
+        except (URLError, OSError, TimeoutError, ValueError, RuntimeError,
+                CalibrationCommandError) as exc:
+            delay = min(300, 5 * 2 ** min(int(reference.get('attempts') or 0), 6))
+            store.mark_reference_retry(reference['capture_id'],
+                                       f'{type(exc).__name__}: {exc}', delay)
+            log.warning('Referencia %s se reintentará: %s',
+                        reference['capture_id'], type(exc).__name__)
+
+    def _post_calibration_reference(self, node_id, branch_id, meta, raw):
+        if not self.backend.connected or self.backend.registration_status != 'registered':
+            raise RuntimeError('Gateway sin autorización vigente')
+        if self.authorize_node(branch_id, node_id) is None:
+            raise PermissionError('Nodo no confirmado en el sistema')
+        identity = self.backend.ensure_identity()
+        timestamp = int(time.time())
+        nonce = secrets.token_urlsafe(18)
+        digest = hashlib.sha256(raw).hexdigest()
+        data = (f'selfiq-calibration-reference-v1\\n{self.config.gateway_id}\\n'
+                f'{timestamp}\\n{nonce}\\n{node_id}\\n{digest}').encode()
+        signature = base64.b64encode(identity.key.sign(data)).decode()
+        meta_b64 = base64.urlsafe_b64encode(
+            json.dumps(meta, separators=(',', ':'), sort_keys=True).encode()
+        ).decode().rstrip('=')
+        url = self._api_url('/devices/' + quote(node_id, safe='')
+                            + '/calibration-references')
+        request = Request(url, data=raw, method='POST', headers={
+            'Content-Type': 'image/jpeg',
+            'X-Timestamp': str(timestamp),
+            'X-Nonce': nonce,
+            'X-Signature': signature,
+            'X-Calibration-Meta': meta_b64,
+        })
+        with urlopen(request, timeout=15) as response:
+            if response.status != 200:
+                raise RuntimeError('Backend devolvió respuesta inesperada')
+            return json.loads(response.read(4096))
+
+    async def _calibration_uploads(self):
+        while True:
+            try:
+                if self.backend.connected and self.cal_store is not None:
+                    due = await asyncio.to_thread(self.cal_store.due_references, 4)
+                    for reference in due:
+                        await asyncio.to_thread(self._upload_reference, reference)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('Fallo al reenviar referencias de calibración')
+            await asyncio.sleep(5)
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         self.connected = (reason_code == 0)
         if self.connected:
@@ -398,7 +648,15 @@ class MQTTBridge:
             if expected_branch and parts[1] != expected_branch:
                 log.warning('ROI ACK descartado: sucursal distinta')
                 return
-            self.notify_roi_ack(message.payload)
+            try:
+                payload = json.loads(message.payload)
+            except (TypeError, ValueError, UnicodeError):
+                log.warning('Command ACK descartado: JSON inválido')
+                return
+            if payload.get('type') == 'cal_result':
+                self.notify_cal_result(payload, parts[1], parts[2], parts[3])
+            else:
+                self.notify_roi_ack(payload)
             return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'telemetry':
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
@@ -513,8 +771,15 @@ class MQTTBridge:
         self.client.connect_async('127.0.0.1', 1883, keepalive=45)
         self.client.loop_start()
         self.worker = asyncio.create_task(self._worker(), name='selfiq-mqtt-registrations')
+        self._ensure_cal_store()
+        self._calibration_worker = asyncio.create_task(
+            self._calibration_uploads(), name='selfiq-calibration-uploads')
 
     async def stop(self):
+        if self._calibration_worker:
+            self._calibration_worker.cancel()
+            await asyncio.gather(self._calibration_worker, return_exceptions=True)
+            self._calibration_worker = None
         if self.worker:
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
@@ -525,3 +790,6 @@ class MQTTBridge:
         if self.outbox:
             await asyncio.to_thread(self.outbox.close)
             self.outbox = None
+        if self.cal_store:
+            await asyncio.to_thread(self.cal_store.close)
+            self.cal_store = None

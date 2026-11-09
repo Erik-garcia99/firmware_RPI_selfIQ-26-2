@@ -13,6 +13,8 @@ from .controller import Controller
 from .backend_link import BackendLink
 from .backend_config import websocket_url
 from .mqtt_bridge import MQTTBridge
+from .calibration import (CalibrationCommandError, ReferenceSpoolFull,
+                          parse_multipart_reference)
 from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 
@@ -92,8 +94,12 @@ def create_app(config, network=None):
     jobs = set()
 
     async def execute(command, message=None):
-        if command in {'snapshot.request', 'roi.set', 'light.test'}:
+        if command in {'snapshot.request', 'roi.set', 'light.test', 'calibrate',
+                       'calibration.commit', 'calibration.cancel', 'calibration.status'}:
             body = message or {}
+            if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
+                           'calibration.status'}:
+                body = body.get('data') if isinstance(body.get('data'), dict) else {}
             try:
                 registered_at = await asyncio.to_thread(
                     mqtt_bridge.authorize_node, body.get('branch_id'), body.get('node_id'))
@@ -119,6 +125,15 @@ def create_app(config, network=None):
             # Solo se confirma la entrega al broker local; el firmware actual
             # del nodo todavía no acciona GPIO de luces.
             return await asyncio.to_thread(mqtt_bridge.test_light, message or {})
+        if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
+                       'calibration.status'}:
+            body = (message or {}).get('data')
+            if not isinstance(body, dict):
+                raise ValueError('Comando de calibración sin data')
+            try:
+                return await asyncio.to_thread(mqtt_bridge.run_calibration, body)
+            except CalibrationCommandError as exc:
+                raise ValueError(str(exc)) from None
         if ctrl.busy:
             raise ValueError('Configuración en curso')
         if not ctrl.online or not ctrl.creds:
@@ -246,7 +261,7 @@ def create_app(config, network=None):
             raise HTTPException(403, 'Token administrativo requerido')
 
     # Rutas que el ESP32 puede llamar sin token admin (red local).
-    CAMERA_PATHS = {'/camera/snapshot'}
+    CAMERA_PATHS = {'/camera/snapshot', '/camera/calibration-reference'}
 
     @app.middleware('http')
     async def restrict(request, call_next):
@@ -369,6 +384,40 @@ def create_app(config, network=None):
         _asyncio.create_task(_forward())
 
         return {'ok': True, 'bytes': len(raw), 'req_id': req_id}
+
+    @app.post('/camera/calibration-reference')
+    async def receive_calibration_reference(request: Request):
+        node_id = request.headers.get('x-node-id', '')
+        branch_id = request.headers.get('x-branch-id', '')
+        if not node_id or not branch_id:
+            raise HTTPException(400, 'Faltan X-Node-Id/X-Branch-Id')
+        try:
+            registered_at = await asyncio.to_thread(
+                mqtt_bridge.authorize_node, branch_id, node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
+        raw_request = await request.body()
+        try:
+            meta, image = parse_multipart_reference(
+                request.headers.get('content-type', ''), raw_request)
+            state, reference = await asyncio.to_thread(
+                mqtt_bridge.accept_calibration_reference,
+                node_id, branch_id, meta, image)
+        except ReferenceSpoolFull:
+            raise HTTPException(507, 'Spool de referencias lleno') from None
+        except CalibrationCommandError as exc:
+            status = 409 if exc.code in ('operation_conflict', 'calibration_not_found') else 422
+            if exc.code == 'storage_full':
+                status = 507
+            raise HTTPException(status, {'code': exc.code, 'detail': exc.detail}) from None
+        return {
+            'ok': True,
+            'capture_id': meta.get('capture_id'),
+            'status': state,
+            'queued': reference.get('status') in ('pending', 'uploading'),
+        }
 
     @app.get('/camera/snapshot')
     async def get_snapshot(request: Request):
