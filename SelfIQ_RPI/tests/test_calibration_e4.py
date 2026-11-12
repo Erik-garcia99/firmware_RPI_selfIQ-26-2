@@ -105,6 +105,26 @@ class FakeClient:
 
 
 class CalibrationContractTests(unittest.TestCase):
+    def test_status_accepts_partial_draft_but_not_missing_crc(self):
+        cmd = validate_command({**command(), 'type': 'calibration.status'})
+        ack = {**ack_for(cmd), 'action': 'status', 'status': 'reported',
+               'active': None, 'draft': {
+                   'calibration_id': cmd['calibration_id'],
+                   'calibration_version': cmd['calibration_version'],
+                   'empty_crc': 'deadbeef', 'full_crc': None}}
+        validate_ack(cmd, ack)
+        del ack['draft']['full_crc']
+        with self.assertRaises(CalibrationCommandError):
+            validate_ack(cmd, ack)
+
+    def test_cancel_requires_version_in_ack(self):
+        cmd = validate_command({**command(), 'type': 'calibration.cancel'})
+        ack = {**ack_for(cmd), 'action': 'cancel', 'status': 'cancelled'}
+        validate_ack(cmd, ack)
+        del ack['calibration_version']
+        with self.assertRaises(CalibrationCommandError):
+            validate_ack(cmd, ack)
+
     def test_validate_command_accepts_contract_without_action_field(self):
         raw = command()
         normalized = validate_command(raw)

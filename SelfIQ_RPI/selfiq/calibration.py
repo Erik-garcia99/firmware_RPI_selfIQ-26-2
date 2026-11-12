@@ -180,6 +180,9 @@ def _status_entry(value, field):
                  and HEX64.fullmatch(value['context_hash']),
                  'invalid_ack', f'{field}.context_hash inválido')
     for key in ('empty_crc', 'full_crc'):
+        _require(key in value, 'invalid_ack', f'{field}.{key} ausente')
+        if field == 'draft' and value[key] is None:
+            continue  # Referencia aún no capturada, no un CRC ficticio.
         _require(isinstance(value.get(key), str) and HEX8.fullmatch(value[key]),
                  'invalid_ack', f'{field}.{key} inválido')
 
