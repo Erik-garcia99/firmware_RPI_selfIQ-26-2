@@ -87,12 +87,26 @@ def event_to_line(event):
     return f"{event_type},{tags} value={value!r} {timestamp_ns}"
 
 
-def send_batch(config, batch):
+def send_batch(config, batch, authorize_node):
     lines = []
     accepted_candidates = []
+    permissions = {}
 
     for event in batch:
         try:
+            parts = event['topic'].split('/')
+            if len(parts) != 5:
+                raise ValueError('Tópico inválido')
+            identity = (parts[1], parts[2])
+            if identity not in permissions:
+                permissions[identity] = authorize_node(*identity)
+            registered_at = permissions[identity]
+            if registered_at is None or event['received_at'] < registered_at:
+                # Rechazo definitivo: no bloquear detrás de él a nodos válidos
+                # ni enviar muestras previas a la confirmación del alta.
+                log.warning('[INFLUX] Evento descartado por registro: %s', event['event_id'])
+                accepted_candidates.append(event['event_id'])
+                continue
             lines.append(event_to_line(event))
             accepted_candidates.append(event["event_id"])
         except (ValueError, TypeError, KeyError, OverflowError):
@@ -103,7 +117,7 @@ def send_batch(config, batch):
             )
 
     if not lines:
-        return []
+        return accepted_candidates
 
     # Si hay un error, la excepción llega a replay_once().
     # En ese caso no se confirma ningún ID de este envío.
@@ -112,7 +126,7 @@ def send_batch(config, batch):
     return accepted_candidates
 
 
-async def run_influx_sync(config, outbox, stop_event):
+async def run_influx_sync(config, outbox, stop_event, authorize_node):
     log.info("[INFLUX] Sincronización iniciada")
 
     while not stop_event.is_set():
@@ -121,13 +135,13 @@ async def run_influx_sync(config, outbox, stop_event):
         try:
             sent = await asyncio.to_thread(
                 outbox.replay_once,
-                lambda batch: send_batch(config, batch),
+                lambda batch: send_batch(config, batch, authorize_node),
                 BATCH_SIZE,
             )
 
             if sent:
                 log.info(
-                    "[INFLUX] API aceptó %d eventos; retirados de SQLite",
+                    "[INFLUX] %d eventos resueltos (enviados o rechazados por registro)",
                     sent,
                 )
 
