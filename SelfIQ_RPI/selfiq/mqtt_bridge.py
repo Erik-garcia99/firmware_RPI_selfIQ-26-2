@@ -1,6 +1,7 @@
 """MQTT local -> alta REST firmada -> respuesta MQTT individual (sin tocar STA/AP)."""
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import math

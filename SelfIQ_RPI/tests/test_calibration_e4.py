@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import sys
 import types
 import json
@@ -9,6 +10,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
+from unittest.mock import MagicMock, Mock, patch
+from urllib.error import URLError
 
 # El entorno de revisión no trae paho-mqtt; el gateway real sí lo instala.
 # Stub mínimo para probar la lógica de E4 sin abrir sockets MQTT.
@@ -198,6 +201,77 @@ class GatewayDispatchTests(unittest.TestCase):
         bridge.connected = True
         bridge.subscriptions_ready.set()
         return bridge
+
+    def _queued_reference(self, bridge, tmp):
+        cmd = command()
+        raw = b'\xff\xd8\xff' + b'calibration-jpeg-test'
+        meta = {**cmd, '_node_id': cmd['node_id'], '_branch_id': cmd['branch_id'],
+                'image_sha256': hashlib.sha256(raw).hexdigest(), 'image_bytes': len(raw)}
+        bridge.cal_store = CalibrationStore(Path(tmp) / 'cal.sqlite3')
+        self.addCleanup(bridge.cal_store.close)
+        _, reference = bridge.cal_store.put_reference(meta, raw)
+        bridge.authorize_node = Mock(return_value={'id': cmd['node_id']})
+        key = Mock()
+        key.sign.return_value = b'test-signature'
+        bridge.backend.ensure_identity = Mock(return_value=SimpleNamespace(key=key))
+        return reference, meta, raw, key
+
+    @staticmethod
+    def _upload_response():
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = b'{"ok":true,"status":"ready"}'
+        return response
+
+    def test_reference_upload_hashes_signs_and_sends_real_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            reference, meta, raw, key = self._queued_reference(bridge, tmp)
+            with patch('selfiq.mqtt_bridge.urlopen', return_value=self._upload_response()) as send:
+                bridge._upload_reference(reference)
+            request = send.call_args.args[0]
+            headers = {name.lower(): value for name, value in request.header_items()}
+            self.assertEqual(request.data, raw)
+            self.assertTrue(request.full_url.endswith(
+                f"/gateways/gw-test/devices/{reference['node_id']}/calibration-references"))
+            self.assertEqual(headers['content-type'], 'image/jpeg')
+            self.assertEqual(json.loads(base64.urlsafe_b64decode(
+                headers['x-calibration-meta'] + '===')), meta)
+            message = (f"selfiq-calibration-reference-v1\\n{bridge.config.gateway_id}\\n"
+                       f"{headers['x-timestamp']}\\n{headers['x-nonce']}\\n"
+                       f"{reference['node_id']}\\n{hashlib.sha256(raw).hexdigest()}").encode()
+            key.sign.assert_called_once_with(message)
+            self.assertEqual(base64.b64decode(headers['x-signature']), b'test-signature')
+            stored = bridge.cal_store.reference(reference['capture_id'])
+            self.assertEqual(stored['status'], 'uploaded')
+            self.assertIsNone(stored['image'])
+
+    def test_reference_transport_failure_preserves_same_jpeg_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            reference, _, raw, _ = self._queued_reference(bridge, tmp)
+            with patch('selfiq.mqtt_bridge.urlopen', side_effect=URLError('offline')):
+                bridge._upload_reference(reference)
+            stored = bridge.cal_store.reference(reference['capture_id'])
+            self.assertEqual(stored['status'], 'pending')
+            self.assertEqual(stored['image'], raw)
+            self.assertEqual(stored['attempts'], 1)
+            self.assertGreater(stored['next_attempt'], time.time())
+            with patch('selfiq.mqtt_bridge.urlopen', return_value=self._upload_response()) as send:
+                bridge._upload_reference(stored)
+            self.assertEqual(send.call_args.args[0].data, raw)
+            self.assertEqual(bridge.cal_store.reference(reference['capture_id'])['status'], 'uploaded')
+
+    def test_reference_without_authorized_node_is_not_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            reference, _, raw, _ = self._queued_reference(bridge, tmp)
+            bridge.authorize_node.return_value = None
+            with patch('selfiq.mqtt_bridge.urlopen') as send:
+                bridge._upload_reference(reference)
+            send.assert_not_called()
+            self.assertEqual(bridge.cal_store.reference(reference['capture_id'])['image'], raw)
 
     def test_cal_result_is_correlated_with_topic_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
