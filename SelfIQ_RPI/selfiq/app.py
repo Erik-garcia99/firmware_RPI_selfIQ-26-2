@@ -74,7 +74,21 @@ class TCPService:
     async def reconcile(self):
         wanted = self.ctrl.can_distribute()
         if wanted and self.server is None:
-            self.server = await asyncio.start_server(self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port)
+            last_error = None
+            for _ in range(5):
+                try:
+                    self.server = await asyncio.start_server(
+                        self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port,
+                        reuse_address=True)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    # El socket anterior puede quedar en TIME_WAIT al bajar/subir el AP.
+                    # Reintentamos antes de declarar el TCP inutilizable.
+                    await asyncio.sleep(0.25)
+            if last_error is not None:
+                raise last_error
         elif not wanted:
             await self.close()
 
