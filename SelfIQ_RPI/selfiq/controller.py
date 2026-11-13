@@ -197,6 +197,10 @@ class Controller:
             self.ap_wanted = True
             self.pairing_until = self.clock() + 120
             self.touch()
+            # Una reapertura explícita debe intentar el AP de inmediato, aunque
+            # el intento anterior haya sido hace menos de 30 s (cancelar y volver
+            # a buscar en una ventana corta).
+            self.last_ap_attempt = 0
             self._start_ap()
             if not self.net.ap_healthy():
                 raise RuntimeError('No se pudo habilitar AP')
