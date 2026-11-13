@@ -11,7 +11,9 @@ from .influx_writer import enviar_influx
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 100
-SYNC_INTERVAL_SECONDS = 5
+# El ESP32 ya entrega las muestras en ~1 s; el outbox local se vacía cada 3 s
+# mientras haya eventos. Sin eventos no se hace ninguna petición a la nube.
+SYNC_INTERVAL_SECONDS = 3
 RETRY_INTERVAL_SECONDS = 60
 NANOSECONDS_PER_SECOND = 1_000_000_000
 
