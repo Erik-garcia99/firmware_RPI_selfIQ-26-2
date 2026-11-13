@@ -17,7 +17,8 @@ import paho.mqtt.client as mqtt
 
 from .backend_config import websocket_url
 from .outbox import Outbox, StorageFull
-from .node_control import reset_frame, parse_reset_result
+from .node_control import (reset_frame, parse_reset_result,
+                           occupancy_adjust_frame, parse_occupancy_adjust_result)
 from .calibration import (
     CalibrationCommandError,
     CalibrationStore,
@@ -52,6 +53,7 @@ class MQTTBridge:
         self.outbox = None
         self.storage_error = ''
         self.reset_waiters = {}
+        self.occupancy_reset_waiters = {}
         self.reset_lock = threading.Lock()
         self._roi_waiters = {}
         self._roi_lock = threading.Lock()
@@ -209,53 +211,39 @@ class MQTTBridge:
             with self.reset_lock:
                 self.reset_waiters.pop(waiter['topic'], None)
 
-    # --- Snapshot bajo demanda ---
-    _snapshot_waiters = {}
-    _snapshot_lock = threading.Lock()
-
-    def request_snapshot(self, message):
-        node_id = message.get('node_id')
-        branch_id = message.get('branch_id')
-        module = message.get('module') or 'shelf_cam'
-        req_id = message.get('req_id') or ('snap-' + secrets.token_hex(4))
-        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
-                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
-                or not isinstance(module, str) or not re.fullmatch(r'[a-z0-9_]{1,32}', module)):
+    def adjust_occupancy(self, message):
+        node_id, branch_id = message.get('node_id'), message.get('branch_id')
+        value = message.get('value', 0)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError('Valor de aforo inválido')
+        if not all(isinstance(v, str) and UUID_RE.fullmatch(v)
+                   for v in (node_id, branch_id)):
             raise ValueError('Identidad del nodo inválida')
         if not self.connected or not self.subscriptions_ready.wait(5):
-            raise ValueError('MQTT no está listo')
-        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
-        waiter = {'event': threading.Event(), 'req_id': req_id, 'result': None}
-        with self._snapshot_lock:
-            self._snapshot_waiters[req_id] = waiter
+            raise ValueError('MQTT no está listo para recibir la confirmación del nodo')
+        topic = f'selfiq/{branch_id}/{node_id}/control'
+        waiter = {'event': threading.Event(), 'topic': topic + '/result', 'result': None}
+        with self.reset_lock:
+            if waiter['topic'] in self.occupancy_reset_waiters:
+                raise ValueError('Ya hay un ajuste de aforo pendiente para este nodo')
+            self.occupancy_reset_waiters[waiter['topic']] = waiter
         try:
-            payload = json.dumps({'type': 'snapshot.request', 'req_id': req_id})
-            log.info('Snapshot solicitado: nodo=%s req=%s tópico=%s', node_id, req_id, topic)
-            info = self.client.publish(topic, payload, qos=1, retain=False)
+            log.info('Ajuste de aforo solicitado: nodo=%s tópico=%s/command valor=%d', node_id, topic, value)
+            info = self.client.publish(topic + '/command', occupancy_adjust_frame(value), qos=1, retain=False)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
-                raise RuntimeError('No se pudo publicar snapshot.request')
-            info.wait_for_publish(timeout=10)
-            if not waiter['event'].wait(15):
-                log.warning('Sin imagen del nodo=%s req=%s (tópico=%s)', node_id, req_id, topic)
-                raise ValueError('El nodo no envió la imagen a tiempo')
+                raise RuntimeError('No se pudo enviar el ajuste de aforo')
+            if not waiter['event'].wait(20):
+                log.warning('Sin confirmación de ajuste de aforo: nodo=%s tópico esperado=%s', node_id, waiter['topic'])
+                raise ValueError('El nodo no confirmó el ajuste de aforo; comprueba que esté conectado y tenga firmware actualizado')
             if waiter['result'] is not True:
-                raise ValueError('El nodo no pudo capturar la imagen')
-            log.info('Snapshot confirmado por nodo=%s req=%s', node_id, req_id)
-            return {'snapshot': True, 'node_id': node_id, 'req_id': req_id}
+                raise ValueError('El nodo no pudo ajustar el contador de aforo')
+            log.info('Ajuste de aforo confirmado por nodo=%s valor=%d', node_id, value)
+            return {'occupancy_adjusted': True, 'node_id': node_id, 'value': value}
         finally:
-            with self._snapshot_lock:
-                self._snapshot_waiters.pop(req_id, None)
+            with self.reset_lock:
+                self.occupancy_reset_waiters.pop(waiter['topic'], None)
 
-    def notify_snapshot(self, node_id, req_id):
-        with self._snapshot_lock:
-            waiter = self._snapshot_waiters.get(req_id)
-            if waiter:
-                waiter['result'] = True
-                waiter['event'].set()
-                return True
-        return False
-
-    # --- Aplicación de ROI (roi.set + ACK) ---
+# --- Aplicación de ROI (roi.set + ACK) ---
     ROI_MODULE = 'shelf_cam'
     ROI_REQ_RE = re.compile(r'[A-Za-z0-9._:-]{1,64}')
 
@@ -624,6 +612,16 @@ class MQTTBridge:
                 result = parse_reset_result(message.payload)
                 with self.reset_lock:
                     waiter = self.reset_waiters.get(message.topic)
+                    if waiter and waiter['topic'] == message.topic:
+                        waiter['result'] = result
+                        waiter['event'].set()
+                return
+            except (ValueError, UnicodeError):
+                pass
+            try:
+                result = parse_occupancy_adjust_result(message.payload)
+                with self.reset_lock:
+                    waiter = self.occupancy_reset_waiters.get(message.topic)
                     if waiter and waiter['topic'] == message.topic:
                         waiter['result'] = result
                         waiter['event'].set()

@@ -131,6 +131,8 @@ def create_app(config, network=None):
                     'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
         if command == 'node.reset':
             return await asyncio.to_thread(mqtt_bridge.reset_node, message or {})
+        if command == 'occupancy.adjust':
+            return await asyncio.to_thread(mqtt_bridge.adjust_occupancy, message or {})
         if command == 'snapshot.request':
             return await asyncio.to_thread(mqtt_bridge.request_snapshot, message or {})
         if command == 'roi.set':
