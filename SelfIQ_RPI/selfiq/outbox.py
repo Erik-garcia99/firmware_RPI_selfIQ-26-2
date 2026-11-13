@@ -1,7 +1,7 @@
-"""Durable local inbox/outbox. No cloud deletion without an explicit receipt.
+"""Durable local inbox/outbox.
 
-The adapter send_batch is deliberately not connected until the backend contract
-is implemented. It must return IDs durably accepted, including deduplication.
+send_batch returns resolved IDs: accepted by InfluxDB or explicitly rejected by
+registration policy. Network/authentication failures preserve pending events.
 """
 import json
 import os

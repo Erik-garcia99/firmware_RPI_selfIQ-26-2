@@ -11,7 +11,10 @@ from .models import Config, Credentials
 from .network import Network
 from .controller import Controller
 from .backend_link import BackendLink
+from .backend_config import websocket_url
 from .mqtt_bridge import MQTTBridge
+from .calibration import (CalibrationCommandError, ReferenceSpoolFull,
+                          parse_multipart_reference)
 from .influx_sync import run_influx_sync
 from .protocol import HEADER, ACK, NACK, encode, read_frame, credentials_frame
 
@@ -69,9 +72,23 @@ class TCPService:
                 pass
 
     async def reconcile(self):
-        wanted = self.ctrl.ap_wanted and self.ctrl.net.ap_healthy() and not self.ctrl.busy
+        wanted = self.ctrl.can_distribute()
         if wanted and self.server is None:
-            self.server = await asyncio.start_server(self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port)
+            last_error = None
+            for _ in range(5):
+                try:
+                    self.server = await asyncio.start_server(
+                        self.handle, self.ctrl.c.ap_ip, self.ctrl.c.tcp_port,
+                        reuse_address=True)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    # El socket anterior puede quedar en TIME_WAIT al bajar/subir el AP.
+                    # Reintentamos antes de declarar el TCP inutilizable.
+                    await asyncio.sleep(0.25)
+            if last_error is not None:
+                raise last_error
         elif not wanted:
             await self.close()
 
@@ -90,7 +107,20 @@ def create_app(config, network=None):
     tcp = TCPService(ctrl)
     jobs = set()
 
-    async def execute(command):
+    async def execute(command, message=None):
+        if command in {'snapshot.request', 'roi.set', 'light.test', 'calibrate',
+                       'calibration.commit', 'calibration.cancel', 'calibration.status'}:
+            body = message or {}
+            if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
+                           'calibration.status'}:
+                body = body.get('data') if isinstance(body.get('data'), dict) else {}
+            try:
+                registered_at = await asyncio.to_thread(
+                    mqtt_bridge.authorize_node, body.get('branch_id'), body.get('node_id'))
+            except Exception:
+                raise ValueError('No se pudo verificar el registro del nodo') from None
+            if registered_at is None:
+                raise ValueError('Nodo no confirmado en el sistema')
         if command == 'status':
             # Backend receives operational state, never SSID/password/username.
             state = ctrl.status()
@@ -99,6 +129,25 @@ def create_app(config, network=None):
                     'backend_connected': backend.connected,
                     'storage_error': mqtt_bridge.storage_error,
                     'outbox': mqtt_bridge.outbox.status() if mqtt_bridge.outbox else None}
+        if command == 'node.reset':
+            return await asyncio.to_thread(mqtt_bridge.reset_node, message or {})
+        if command == 'snapshot.request':
+            return await asyncio.to_thread(mqtt_bridge.request_snapshot, message or {})
+        if command == 'roi.set':
+            return await asyncio.to_thread(mqtt_bridge.set_rois, message or {})
+        if command == 'light.test':
+            # Solo se confirma la entrega al broker local; el firmware actual
+            # del nodo todavía no acciona GPIO de luces.
+            return await asyncio.to_thread(mqtt_bridge.test_light, message or {})
+        if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
+                       'calibration.status'}:
+            body = (message or {}).get('data')
+            if not isinstance(body, dict):
+                raise ValueError('Comando de calibración sin data')
+            try:
+                return await asyncio.to_thread(mqtt_bridge.run_calibration, body)
+            except CalibrationCommandError as exc:
+                raise ValueError(str(exc)) from None
         if ctrl.busy:
             raise ValueError('Configuración en curso')
         if not ctrl.online or not ctrl.creds:
@@ -161,6 +210,7 @@ def create_app(config, network=None):
                     config,
                     mqtt_bridge.outbox,
                     influx_stop,
+                    mqtt_bridge.authorize_node,
                 ),
                 name="selfiq-influx-sync",
             )
@@ -195,9 +245,8 @@ def create_app(config, network=None):
                 )
 
             await mqtt_bridge.stop()
-
-
             backend_task.cancel()
+
             await asyncio.gather(
                 task,
                 backend_task,
@@ -232,19 +281,26 @@ def create_app(config, network=None):
         if not secrets.compare_digest(request.headers.get('x-selfiq-token', ''), config.admin_token):
             raise HTTPException(403, 'Token administrativo requerido')
 
+    # Rutas que el ESP32 puede llamar sin token admin (red local).
+    CAMERA_PATHS = {'/camera/snapshot', '/camera/calibration-reference'}
+
     @app.middleware('http')
     async def restrict(request, call_next):
         try:
             address = peer(request)
-            if not address.is_loopback and not (address in ap_subnet and ctrl.net.ap_healthy()):
+            if not address.is_loopback and not (address in ap_subnet and ctrl.net.ap_healthy()) \
+                    and request.url.path not in CAMERA_PATHS:
                 admin(request)
             # No CORS. Block cross-site form/fetch submissions and DNS rebinding.
             if request.method != 'GET':
                 host = request.headers.get('host', '')
-                if host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost') and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable', '/admin/tcp/disable', '/admin/backend/configure'):
+                if (host.split(':')[0] not in (config.ap_ip, '127.0.0.1', 'localhost')
+                        and request.url.path not in ('/admin/ap/enable', '/admin/tcp/enable',
+                                                    '/admin/tcp/disable', '/admin/backend/configure')
+                        and request.url.path not in CAMERA_PATHS):
                     raise HTTPException(403, 'Host no permitido')
                 origin = request.headers.get('origin')
-                if origin and origin != 'http://' + host:
+                if origin and origin != 'http://' + host and request.url.path not in CAMERA_PATHS:
                     raise HTTPException(403, 'Origen no permitido')
             response = await call_next(request)
         except HTTPException as exc:
@@ -278,6 +334,130 @@ def create_app(config, network=None):
                 'gateway_id': config.gateway_id, 'branch_id': backend.branch_id,
                 'registration_status': backend.registration_status,
                 'registration_alert': 'Corrija el token de sucursal' if backend.registration_status in ('token_invalid', 'registration_rejected') else None}
+
+    # Almacenamiento en memoria de la ultima imagen por nodo.
+    _snapshots = {}
+
+    @app.post('/camera/snapshot')
+    async def receive_snapshot(request: Request):
+        node_id = request.headers.get('x-node-id', '')
+        branch_id = request.headers.get('x-branch-id', '')
+        req_id = request.headers.get('x-req-id', '')
+        if not node_id:
+            raise HTTPException(400, 'Falta X-Node-Id')
+        try:
+            registered_at = await asyncio.to_thread(mqtt_bridge.authorize_node, branch_id, node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
+        raw = await request.body()
+        if not raw or len(raw) > 200000:
+            raise HTTPException(413, 'Imagen demasiado grande o vacia')
+        _snapshots[node_id] = {
+            'data': raw,
+            'req_id': req_id,
+            'branch_id': branch_id,
+            'received_at': __import__('time').time(),
+        }
+        log.info('Snapshot recibido: nodo=%s req=%s bytes=%d', node_id, req_id, len(raw))
+        # Notificar al waiter del comando snapshot.request
+        if req_id:
+            mqtt_bridge.notify_snapshot(node_id, req_id)
+
+        # Reenviar al backend firmado (Ed25519) en segundo plano.
+        async def _forward():
+            try:
+                if not backend.connected:
+                    log.warning('Snapshot no reenviado: backend desconectado')
+                    return
+                if await asyncio.to_thread(mqtt_bridge.authorize_node, branch_id, node_id) is None:
+                    log.warning('Snapshot no reenviado: nodo no autorizado')
+                    return
+                identity = backend.ensure_identity()
+                import time as _t, secrets as _s, base64 as _b64, hashlib as _hl
+                from urllib.request import Request as _Req, urlopen as _urlopen
+                from urllib.parse import urlsplit, urlunsplit, quote as _quote
+                ts = int(_t.time())
+                nonce = _s.token_urlsafe(18)
+                img_hash = _hl.sha256(raw).hexdigest()
+                data = (f'selfiq-snapshot-v1\\n{config.gateway_id}\\n{ts}\\n{nonce}\\n{node_id}\\n{img_hash}').encode()
+                sig = _b64.b64encode(identity.key.sign(data)).decode()
+                base = urlsplit(websocket_url(config.backend_ws_url))
+                scheme = 'https' if base.scheme == 'wss' else 'http'
+                prefix = (base.path.removesuffix('/ws/gateways') + '/gateways/'
+                          + _quote(config.gateway_id, safe=''))
+                url = urlunsplit((scheme, base.netloc, prefix + '/devices/' + _quote(node_id, safe='') + '/snapshot', '', ''))
+                req = _Req(url, data=raw, headers={
+                    'Content-Type': 'image/jpeg',
+                    'X-Timestamp': str(ts),
+                    'X-Nonce': nonce,
+                    'X-Signature': sig,
+                    'X-Gateway-Id': config.gateway_id,
+                }, method='POST')
+                with _urlopen(req, timeout=15) as resp:
+                    log.info('Snapshot reenviado al backend: %s (HTTP %s)', node_id, resp.status)
+            except Exception as exc:
+                log.warning('No se pudo reenviar snapshot al backend: %s: %s',
+                            type(exc).__name__, exc)
+
+        import asyncio as _asyncio
+        _asyncio.create_task(_forward())
+
+        return {'ok': True, 'bytes': len(raw), 'req_id': req_id}
+
+    @app.post('/camera/calibration-reference')
+    async def receive_calibration_reference(request: Request):
+        node_id = request.headers.get('x-node-id', '')
+        branch_id = request.headers.get('x-branch-id', '')
+        if not node_id or not branch_id:
+            raise HTTPException(400, 'Faltan X-Node-Id/X-Branch-Id')
+        try:
+            registered_at = await asyncio.to_thread(
+                mqtt_bridge.authorize_node, branch_id, node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
+        raw_request = await request.body()
+        try:
+            meta, image = parse_multipart_reference(
+                request.headers.get('content-type', ''), raw_request)
+            state, reference = await asyncio.to_thread(
+                mqtt_bridge.accept_calibration_reference,
+                node_id, branch_id, meta, image)
+        except ReferenceSpoolFull:
+            raise HTTPException(507, 'Spool de referencias lleno') from None
+        except CalibrationCommandError as exc:
+            status = 409 if exc.code in ('operation_conflict', 'calibration_not_found') else 422
+            if exc.code == 'storage_full':
+                status = 507
+            raise HTTPException(status, {'code': exc.code, 'detail': exc.detail}) from None
+        return {
+            'ok': True,
+            'capture_id': meta.get('capture_id'),
+            'status': state,
+            'queued': reference.get('status') in ('pending', 'uploading'),
+        }
+
+    @app.get('/camera/snapshot')
+    async def get_snapshot(request: Request):
+        node_id = request.query_params.get('node_id', '')
+        if not node_id or node_id not in _snapshots:
+            raise HTTPException(404, 'Sin imagen para este nodo')
+        snap = _snapshots[node_id]
+        try:
+            registered_at = await asyncio.to_thread(
+                mqtt_bridge.authorize_node, snap['branch_id'], node_id)
+        except Exception:
+            raise HTTPException(503, 'No se pudo verificar el registro del nodo') from None
+        if registered_at is None:
+            _snapshots.pop(node_id, None)
+            raise HTTPException(403, 'Nodo no confirmado en el sistema')
+        from fastapi.responses import Response as RawResponse
+        return RawResponse(content=snap['data'], media_type='image/jpeg',
+                           headers={'X-Received-At': str(snap['received_at']),
+                                    'X-Req-Id': snap['req_id']})
 
     @app.post('/configure', status_code=202)
     async def configure(request: Request):
