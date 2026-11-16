@@ -6,7 +6,8 @@ import tempfile
 from pathlib import Path
 import httpx
 from selfiq.app import create_app, TCPService
-from selfiq.models import Config, Credentials
+from selfiq.models import Credentials
+from test_support import make_config as Config
 from selfiq.controller import Controller
 from selfiq.protocol import *
 from test_selfiq import FakeNetwork
@@ -39,7 +40,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(state['configuracion_requerida'])
                 self.assertEqual((await client.get('/', headers=headers)).status_code, 409)
                 reader, writer = await asyncio.open_connection('127.0.0.1', tcp.server.sockets[0].getsockname()[1])
-                writer.write(encode(HEADER, 0, 1, b'\x00'))
+                writer.write(encode(HEADER, 1, 1, b'\x00'))
                 await writer.drain()
                 self.assertEqual((await read_frame(reader)).data, credentials_frame(ctrl.creds)[4:])
                 self.assertEqual(Path(c.state_file).read_bytes(), original)
@@ -104,8 +105,9 @@ class TCPTests(unittest.IsolatedAsyncioTestCase):
         self.net = FakeNetwork()
         self.ctrl = Controller(replace(Config(), ap_ip='127.0.0.1', tcp_port=0), self.net)
         self.ctrl.creds = Credentials('Casa', '12345678')
-        self.ctrl.online = True
-        self.net.ap_active = True
+        self.ctrl.profile = 'selfiq-sta-a'
+        self.net.current = self.ctrl.profile
+        self.ctrl.reopen()
         self.service = TCPService(self.ctrl)
         await self.service.reconcile()
         self.port = self.service.server.sockets[0].getsockname()[1]
@@ -114,7 +116,7 @@ class TCPTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
     async def test_real_socket_fragmentation_and_ack(self):
         r, w = await asyncio.open_connection('127.0.0.1', self.port)
-        packet = encode(HEADER, 0, 1, b'\x00')
+        packet = encode(HEADER, 1, 1, b'\x00')
         for b in packet:
             w.write(bytes([b]))
             await w.drain()
@@ -131,7 +133,7 @@ class TCPTests(unittest.IsolatedAsyncioTestCase):
         r, w = await asyncio.open_connection('127.0.0.1', self.port)
         original = self.ctrl.last_request
         self.ctrl.online = False
-        w.write(encode(HEADER, 0, 1, b'\x00'))
+        w.write(encode(HEADER, 1, 1, b'\x00'))
         await w.drain()
         self.assertTrue((await read_frame(r)).nack)
         self.ctrl.online = True
@@ -158,10 +160,12 @@ class TCPTests(unittest.IsolatedAsyncioTestCase):
         self.ctrl.clock = lambda: now[0]
         self.ctrl.profile = 'selfiq-sta-a'
         self.net.current = self.ctrl.profile
+        # Isolate idle timeout from the independent 120 s enrollment deadline.
+        self.ctrl.pairing_until = now[0] + 1000
         self.ctrl.touch()
         reader, writer = await asyncio.open_connection('127.0.0.1', self.port)
         now[0] += 299
-        writer.write(encode(HEADER, 0, 1, b'\x00'))
+        writer.write(encode(HEADER, 1, 1, b'\x00'))
         await writer.drain()
         await read_frame(reader)
         now[0] += 299
