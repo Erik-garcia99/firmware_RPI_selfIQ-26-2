@@ -31,6 +31,9 @@ class Outbox:
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id TEXT UNIQUE NOT NULL, topic TEXT NOT NULL,
             payload TEXT NOT NULL, received_at REAL NOT NULL)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS event_quarantine (
+            event_id TEXT PRIMARY KEY, topic TEXT NOT NULL, payload TEXT NOT NULL,
+            received_at REAL NOT NULL, reason TEXT NOT NULL, quarantined_at REAL NOT NULL)''')
         self.db.commit()
 
     def size(self):
@@ -51,11 +54,20 @@ class Outbox:
             raise ValueError('event_type invalido')
         if 'data' not in data:
             raise ValueError('Falta data')
+        if data['event_type'] == 'roi_occ':
+            from .roi_telemetry import validate_roi_occ
+            parts = topic.split('/')
+            if len(parts) != 5 or parts[0] != 'selfiq' or parts[4] != 'telemetry':
+                raise ValueError('Invalid roi_occ topic')
+            validate_roi_occ(data['data'], parts[3])
         # Reject NaN, Infinity and malformed JSON, preserve original payload for equality.
         json.dumps(data, allow_nan=False)
         raw = payload.decode('utf-8') if isinstance(payload, bytes) else payload
         with self.lock:
-            old = self.db.execute('SELECT topic,payload FROM events WHERE event_id=?', (event_id,)).fetchone()
+            old = self.db.execute(
+                '''SELECT topic,payload FROM events WHERE event_id=?
+                   UNION ALL SELECT topic,payload FROM event_quarantine WHERE event_id=?''',
+                (event_id, event_id)).fetchone()
             if old:
                 if old != (topic, raw):
                     raise ValueError('event_id reutilizado con contenido distinto')
@@ -87,6 +99,16 @@ class Outbox:
     def acknowledge(self, ids):
         with self.lock, self.db:
             self.db.executemany('DELETE FROM events WHERE event_id=?', ((i,) for i in ids))
+
+    def quarantine(self, event, reason):
+        """Atomically archive an incompatible event, never discard its payload."""
+        with self.lock, self.db:
+            self.db.execute(
+                '''INSERT OR IGNORE INTO event_quarantine
+                   (event_id,topic,payload,received_at,reason,quarantined_at)
+                   SELECT event_id,topic,payload,received_at,?,? FROM events WHERE event_id=?''',
+                (str(reason)[:120], time.time(), event['event_id']))
+            self.db.execute('DELETE FROM events WHERE event_id=?', (event['event_id'],))
 
     def replay_once(self, send_batch, limit=100):
         batch = self.batch(limit)

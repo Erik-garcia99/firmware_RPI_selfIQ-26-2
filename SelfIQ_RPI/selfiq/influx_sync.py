@@ -6,6 +6,7 @@ from decimal import Decimal
 from urllib.error import HTTPError
 
 from .influx_writer import enviar_influx
+from .roi_telemetry import validate_roi_occ
 
 
 log = logging.getLogger(__name__)
@@ -83,11 +84,16 @@ def event_to_line(event):
         f"module={escape_tag(module)}",
         f"event_id={escape_tag(event_id)}",
     ))
+    if event_type == 'roi_occ':
+        validate_roi_occ(data, module)
+        tags += (f",roi_id={data['roi_id']}"
+                 f",config_version={data['config_version']}"
+                 f",calibration_version={data['calibration_version']}")
 
     return f"{event_type},{tags} value={value!r} {timestamp_ns}"
 
 
-def send_batch(config, batch, authorize_node):
+def send_batch(config, batch, authorize_node, quarantine=None):
     lines = []
     accepted_candidates = []
     permissions = {}
@@ -110,9 +116,13 @@ def send_batch(config, batch, authorize_node):
             lines.append(event_to_line(event))
             accepted_candidates.append(event["event_id"])
         except (ValueError, TypeError, KeyError, OverflowError):
-            # No eliminar un evento que no pudimos convertir.
+            # Optional durable archive: keep the original payload for diagnosis,
+            # without starving all future batches behind incompatible events.
+            if quarantine is not None:
+                quarantine(event, 'incompatible_influx_event')
+                accepted_candidates.append(event['event_id'])
             log.error(
-                "[INFLUX] Evento no compatible; permanece en SQLite: %s",
+                "[INFLUX] Evento no compatible; conservado en SQLite: %s",
                 event.get("event_id", "sin_id"),
             )
 
@@ -135,7 +145,7 @@ async def run_influx_sync(config, outbox, stop_event, authorize_node):
         try:
             sent = await asyncio.to_thread(
                 outbox.replay_once,
-                lambda batch: send_batch(config, batch, authorize_node),
+                lambda batch: send_batch(config, batch, authorize_node, outbox.quarantine),
                 BATCH_SIZE,
             )
 
