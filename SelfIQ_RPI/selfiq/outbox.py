@@ -54,12 +54,15 @@ class Outbox:
             raise ValueError('event_type invalido')
         if 'data' not in data:
             raise ValueError('Falta data')
-        if data['event_type'] == 'roi_occ':
-            from .roi_telemetry import validate_roi_occ
+        if data['event_type'] in ('roi_occ', 'cam_moved'):
+            from .roi_telemetry import validate_cam_moved, validate_roi_occ
             parts = topic.split('/')
             if len(parts) != 5 or parts[0] != 'selfiq' or parts[4] != 'telemetry':
-                raise ValueError('Invalid roi_occ topic')
-            validate_roi_occ(data['data'], parts[3])
+                raise ValueError('Invalid %s topic' % data['event_type'])
+            if data['event_type'] == 'roi_occ':
+                validate_roi_occ(data['data'], parts[3])
+            else:
+                validate_cam_moved(data['data'], parts[3])
         # Reject NaN, Infinity and malformed JSON, preserve original payload for equality.
         json.dumps(data, allow_nan=False)
         raw = payload.decode('utf-8') if isinstance(payload, bytes) else payload

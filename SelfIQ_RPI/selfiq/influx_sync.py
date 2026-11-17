@@ -6,7 +6,7 @@ from decimal import Decimal
 from urllib.error import HTTPError
 
 from .influx_writer import enviar_influx
-from .roi_telemetry import validate_roi_occ
+from .roi_telemetry import validate_cam_moved, validate_roi_occ
 
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,12 @@ def event_to_line(event):
         tags += (f",roi_id={data['roi_id']}"
                  f",config_version={data['config_version']}"
                  f",calibration_version={data['calibration_version']}")
+    elif event_type == 'cam_moved':
+        validate_cam_moved(data, module)
+        tags += (f",roi_id={data['roi_id']}"
+                 f",config_version={data['config_version']}"
+                 f",calibration_version={data['calibration_version']}"
+                 f",streak={data['streak']}")
 
     return f"{event_type},{tags} value={value!r} {timestamp_ns}"
 
