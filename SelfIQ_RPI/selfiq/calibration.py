@@ -571,7 +571,8 @@ class CalibrationStore:
                 'SELECT COALESCE(SUM(image_bytes), 0) FROM calibration_reference '
                 'WHERE image IS NOT NULL').fetchone()[0]
             count = self.db.execute(
-                'SELECT count(*) FROM calibration_reference').fetchone()[0]
+                'SELECT count(*) FROM calibration_reference '
+                'WHERE image IS NOT NULL').fetchone()[0]
             if (used + len(raw) > REFERENCE_SPOOL_MAX_BYTES
                     or count >= REFERENCE_SPOOL_MAX_ITEMS):
                 raise ReferenceSpoolFull('Spool de referencias lleno')

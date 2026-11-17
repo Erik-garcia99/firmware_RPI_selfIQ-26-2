@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from selfiq.models import Config, Credentials, atomic_json
+from selfiq.models import Credentials, atomic_json
+from test_support import make_config as Config
 from selfiq.protocol import *
 from selfiq.controller import Controller
+from selfiq.credential_integrity import read_state
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_fragmented_and_coalesced_frames(self):
@@ -46,10 +48,15 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_credentials_wire(self):
         c = Credentials('Casa', '12345678').validate()
         self.assertEqual(credentials_frame(c), bytes.fromhex('5433111269044361736170083132333435363738'))
-        c = Credentials('S'*32, 'P'*64, 2, 'U'*31).validate()
+        c = Credentials('S'*32, 'P'*63).validate()
         packet = credentials_frame(c)
-        self.assertEqual(len(packet), 137)
-        self.assertEqual(packet[3], 0x22)
+        self.assertEqual(len(packet), 103)
+        self.assertEqual(packet[3], 0x12)
+        self.assertEqual(packet[4:], tlv(SSID, c.ssid) + tlv(PASSWORD, c.password))
+
+    async def test_enterprise_credentials_are_rejected(self):
+        with self.assertRaises(ValueError):
+            Credentials('S'*32, 'P'*64, 2, 'U'*31).validate()
 
 class FakeNetwork:
     def __init__(self):
@@ -70,6 +77,12 @@ class FakeNetwork:
         return self.accept
     def candidate(self, name, c): self.profiles.add(name)
     def disconnect_sta(self): self.current = None
+    def enable_autoconnect(self, name): pass
+    def ap_clients(self): return 0
+    def run(self, *args, **kwargs):
+        if not self.current:
+            return '--'
+        return self.current if 'GENERAL.CONNECTION' in args else '192.168.1.5/24'
 
 class ControllerTests(unittest.TestCase):
     def setUp(self):
@@ -90,9 +103,13 @@ class ControllerTests(unittest.TestCase):
     def test_success_persist_reboot_and_idle(self):
         self.ctrl.bootstrap()
         self.ctrl.configure(self.creds)
+        # Saving STA no longer opens enrollment; only an explicit search does.
+        self.assertFalse(self.net.ap_active)
+        self.assertFalse(self.ctrl.can_distribute())
+        self.ctrl.reopen()
         self.assertTrue(self.ctrl.can_distribute())
-        self.assertEqual(json.loads(Path(self.c.state_file).read_text())['credentials']['ssid'], 'Casa')
-        self.now += 299
+        self.assertEqual(read_state(self.c.state_file)['credentials']['ssid'], 'Casa')
+        self.now += 119
         self.ctrl.tick()
         self.assertTrue(self.net.ap_active)
         self.now += 1
@@ -102,11 +119,16 @@ class ControllerTests(unittest.TestCase):
         reboot.bootstrap()
         self.assertTrue(reboot.online)
         self.assertFalse(self.net.ap_active)
-    def test_valid_request_extends_idle_and_admin_reopens(self):
+    def test_activity_updates_idle_but_does_not_extend_pairing_window(self):
         self.ctrl.configure(self.creds)
-        self.now += 299
-        self.ctrl.touch()
-        self.now += 299
+        self.ctrl.reopen()
+        deadline = self.ctrl.pairing_until
+        self.now += 60
+        self.assertEqual(self.ctrl.requested_credentials(), self.creds)
+        self.assertEqual(self.ctrl.last_request, self.now)
+        # Activity does not extend the fixed 120 s enrollment window.
+        self.assertEqual(self.ctrl.pairing_until, deadline)
+        self.now += 59
         self.ctrl.tick()
         self.assertTrue(self.net.ap_active)
         self.now += 2
@@ -116,24 +138,43 @@ class ControllerTests(unittest.TestCase):
     def test_failed_candidate_not_persisted(self):
         self.ctrl.bootstrap()
         self.net.accept = False
-        self.ctrl.configure(self.creds)
+        with self.assertRaises(RuntimeError):
+            self.ctrl.configure(self.creds)
         self.assertFalse(Path(self.c.state_file).exists())
         self.assertFalse(self.ctrl.can_distribute())
+        # AP retries are rate-limited after the bootstrap attempt.
+        self.now += 30
+        self.ctrl.tick()
         self.assertTrue(self.net.ap_active)
         self.assertFalse(self.ctrl.busy)
     def test_failed_replacement_preserves_saved_credentials(self):
         self.ctrl.configure(self.creds)
         original = Path(self.c.state_file).read_bytes()
         self.net.accept = False
-        self.ctrl.configure(Credentials('Otro', 'abcdefgh'))
+        self.net.current = None
+        with self.assertRaises(RuntimeError):
+            self.ctrl.configure(Credentials('Otro', 'abcdefgh'))
         self.assertEqual(Path(self.c.state_file).read_bytes(), original)
         self.assertEqual(self.ctrl.creds.ssid, 'Casa')
+    def test_active_sta_cannot_be_replaced(self):
+        self.ctrl.configure(self.creds)
+        saved = Path(self.c.state_file).read_bytes()
+        profile = self.net.current
+        profiles = self.net.profiles.copy()
+        with self.assertRaisesRegex(RuntimeError, 'STA ya conectada'):
+            self.ctrl.configure(Credentials('Otro', 'abcdefgh'))
+        self.assertEqual(self.net.current, profile)
+        self.assertEqual(self.net.profiles, profiles)
+        self.assertEqual(Path(self.c.state_file).read_bytes(), saved)
     def test_sta_loss_reopens_and_retries(self):
         self.ctrl.configure(self.creds)
         self.net.current = None
         self.net.accept = False
         self.ctrl.tick()
         self.assertFalse(self.ctrl.online)
+        self.assertFalse(self.net.ap_active)
+        self.now += self.c.offline_ap_delay
+        self.ctrl.tick()
         self.assertTrue(self.net.ap_active)
         self.net.accept = True
         self.now += 61
@@ -174,6 +215,11 @@ class ControllerTests(unittest.TestCase):
             self.ctrl.reopen()
 
 class ModelTests(unittest.TestCase):
+    def test_test_settings_have_isolated_storage(self):
+        first, second = Config(), Config()
+        for field in ('offline_db', 'state_file', 'gateway_state_file', 'runtime_dir'):
+            self.assertNotEqual(getattr(first, field), getattr(second, field))
+
     def test_byte_limits_and_injection(self):
         for c in (Credentials('á'*17, '12345678'), Credentials('bad\nssid', '12345678'), Credentials('Casa', 'short'), Credentials('S', 'P', 2, 'U'*32), Credentials('S', 'P', 3)):
             with self.assertRaises(ValueError): c.validate()

@@ -2,7 +2,7 @@
 import asyncio
 import base64
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import json
@@ -28,6 +28,7 @@ from selfiq.backend_config import websocket_url
 from selfiq.backend_link import BackendLink
 from selfiq.gateway_identity import GatewayIdentity
 from selfiq.models import Config
+from test_support import make_config
 
 
 def signed_backend(gateways, api_token):
@@ -85,6 +86,13 @@ def signed_backend(gateways, api_token):
 
 
 class CloudConfigTests(unittest.TestCase):
+    def test_incomplete_config_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps({'admin_token': 'A'*32}))
+            with self.assertRaises(TypeError):
+                Config.load(path)
+
     def test_url_conversion(self):
         for value in ('https://selfiq.up.railway.app', 'https://selfiq.up.railway.app/',
                       'wss://selfiq.up.railway.app/ws/gateways/',
@@ -105,8 +113,8 @@ class CloudConfigTests(unittest.TestCase):
     def test_config_fallback_and_environment_priority(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.json'
-            path.write_text(json.dumps({'admin_token': 'A'*32,
-                'backend_ws_url': 'wss://saved.example/ws/gateways'}))
+            path.write_text(json.dumps(asdict(make_config(
+                backend_ws_url='wss://saved.example/ws/gateways'))))
             with patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(Config.load(path).backend_ws_url, 'wss://saved.example/ws/gateways')
             with patch.dict(os.environ, {'SELFIQ_BACKEND_URL':'https://cloud.example'}, clear=True):
@@ -117,7 +125,7 @@ class CloudConfigTests(unittest.TestCase):
 
     def test_identity_and_token_survive_restart(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = replace(Config(), gateway_state_file=directory+'/gateway.json')
+            config = make_config(gateway_state_file=directory+'/gateway.json')
             identity = GatewayIdentity(config)
             identifier = config.gateway_id
             public_key = identity.proof('n'*32)['public_key']
@@ -148,17 +156,18 @@ class TLSLinkTests(unittest.IsolatedAsyncioTestCase):
             trust = ssl.create_default_context(cafile=str(path/'cert.pem'))
             app = signed_backend({'rpi-test':'T'*32}, 'A'*32)
             sock = socket.socket(); sock.bind(('127.0.0.1', 0))
+            self.addCleanup(sock.close)
             port = sock.getsockname()[1]
             server = uvicorn.Server(uvicorn.Config(app, log_level='error', access_log=False,
                 ssl_certfile=str(path/'cert.pem'), ssl_keyfile=str(path/'key.pem')))
-            server_task = asyncio.create_task(server.serve(sockets=[sock]))
-            link_task = None
             async def execute(command, message=None): return {'executed':command}
-            config = replace(Config(), gateway_id='rpi-test', gateway_token='T'*32,
+            config = make_config(gateway_id='rpi-test', gateway_token='T'*32,
                 gateway_state_file=str(path/'gateway.json'),
                 backend_ws_url=f'https://127.0.0.1:{port}')
             link = BackendLink(config, execute)
             def tls_connect(url, **kwargs): return connect(url, ssl=trust, proxy=None, **kwargs)
+            server_task = asyncio.create_task(server.serve(sockets=[sock]))
+            link_task = None
             try:
                 for _ in range(200):
                     if server.started: break
