@@ -19,6 +19,13 @@ def payload(identifier='one', **changes):
     return json.dumps(dict(event_id=identifier, event_type='roi_occ', data=data))
 
 
+def cam_moved_payload(identifier='moved', **changes):
+    data = dict(value=1, roi_id=ROI, config_version=28,
+                calibration_version=16, streak=5, uptime_ms=424593)
+    data.update(changes)
+    return json.dumps(dict(event_id=identifier, event_type='cam_moved', data=data))
+
+
 class RoiTelemetryTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -67,6 +74,33 @@ class RoiTelemetryTests(unittest.TestCase):
                      payload=dict(event_type='occupancy', data=dict(value=5)))
         self.assertTrue(event_to_line(event).startswith('occupancy,'))
         self.assertNotIn('roi_id=', event_to_line(event))
+
+    def test_cam_moved_is_own_influx_series_with_roi_tags(self):
+        self.store.put(TOPIC, cam_moved_payload())
+        line = event_to_line(self.store.batch()[0])
+        self.assertTrue(line.startswith('cam_moved,'))
+        self.assertIn(',roi_id=' + ROI, line)
+        self.assertIn(',config_version=28', line)
+        self.assertIn(',calibration_version=16', line)
+        self.assertIn(',streak=5', line)
+        self.assertIn(' value=1.0 ', line)
+        with patch('selfiq.influx_sync.enviar_influx') as send:
+            self.store.replay_once(
+                lambda batch: send_batch(self.config, batch, lambda *a: 0,
+                                         self.store.quarantine))
+        self.assertEqual(self.store.batch(), [])
+        self.assertEqual(self.store.db.execute(
+            'SELECT count(*) FROM event_quarantine').fetchone()[0], 0)
+
+    def test_invalid_cam_moved_rejected_without_blocking_roi_occ(self):
+        for index, change in enumerate((dict(value=0), dict(streak=0),
+                                        dict(roi_id='bad'), dict(config_version=0),
+                                        dict(calibration_version='16'))):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.store.put(TOPIC, cam_moved_payload('bad-%d' % index, **change))
+        self.store.put(TOPIC, cam_moved_payload())
+        self.store.put(TOPIC, payload())
+        self.assertEqual(len(self.store.batch()), 2)
 
     def test_incompatible_old_event_is_archived_without_starving_new_events(self):
         bad = json.dumps(dict(event_id='legacy', event_type='temperature', data={}))
