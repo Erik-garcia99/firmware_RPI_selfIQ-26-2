@@ -1,3 +1,5 @@
 .env
   SelfIQ_RPI/selfiq/__pycache__/
 **/__pycache__/
+*.pyc
+*.pyo
