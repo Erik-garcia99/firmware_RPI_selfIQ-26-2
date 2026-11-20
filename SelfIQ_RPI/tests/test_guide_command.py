@@ -73,7 +73,8 @@ class GuideCommandTests(unittest.TestCase):
             elif wire.get('t') in ('guide.start', 'guide.stop'):
                 applied = 'off' if wire['t'] == 'guide.stop' else 'on'
                 self.bridge._on_message(None, None, mqtt_message(
-                    ACK_TOPIC, result(wire['id'], applied=applied, uptime=wire['accept_ms'] + 10)))
+                    ACK_TOPIC, result(wire['id'], applied=applied,
+                                     uptime=wire.get('accept_ms', 5000) + 10)))
             elif wire.get('type') == 'light.test':
                 self.bridge._on_message(None, None, mqtt_message(ACK_TOPIC, {
                     'v': 1, 't': 'guide.result', 'id': 'lt-firmware-01',
@@ -113,6 +114,8 @@ class GuideCommandTests(unittest.TestCase):
         self.assertEqual(outcome['light'], 'off')
         self.assertEqual(self.sent[0]['t'], 'guide.stop')
         self.assertNotIn('end_ms', self.sent[0])
+        # El firmware exige exactamente v,t,id,session,ch,boot en guide.stop.
+        self.assertEqual(set(self.sent[0]), {'v', 't', 'id', 'session', 'ch', 'boot'})
 
     def test_foreign_and_wrong_session_results_are_ignored(self):
         waiter = {'id': 'gd-abcdef0123456789', 'kind': 'start', 'expect': 'guide.result',

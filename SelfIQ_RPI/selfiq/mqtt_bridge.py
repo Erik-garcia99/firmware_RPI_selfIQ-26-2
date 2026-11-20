@@ -339,16 +339,20 @@ class MQTTBridge:
         boot, uptime = self._guide_deadline(branch_id, node_id)
         accept_ms = uptime + accept_window_ms
         command_id = f'gd-{secrets.token_hex(8)}'
+        # El contrato §7.2 admite exactamente seis claves en guide.stop: un
+        # `accept_ms` extra hace que el firmware lo rechace como malformado y
+        # no emita resultado (el gateway agota su espera y el apagado queda
+        # sin confirmar). Solo guide.start lleva plazos.
         wire = {'v': 1, 't': action, 'id': command_id, 'session': session,
-                'ch': channel, 'boot': boot, 'accept_ms': accept_ms}
+                'ch': channel, 'boot': boot}
         if action == 'guide.start':
+            wire['accept_ms'] = accept_ms
             wire['end_ms'] = accept_ms + ttl_ms
         waiter = {'id': command_id, 'kind': 'start', 'expect': 'guide.result',
                   'event': threading.Event(), 'result': None, 'unknown': False,
                   'branch_id': branch_id, 'node_id': node_id, 'session': session,
                   'channel': channel}
         self._guide_register(waiter)
-        started = time.monotonic()
         try:
             topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
             self._guide_publish(topic, json.dumps(wire, separators=(',', ':')))
@@ -514,8 +518,15 @@ class MQTTBridge:
             log.info('Capacidades de guía reenviadas: nodo=%s canales=%s', node_id, caps['channels'])
             return True
         except HTTPError as exc:
-            log.warning('Capacidades de guía pendientes: nodo=%s HTTP=%s; se reintentará',
-                        node_id, exc.code)
+            detail = ''
+            try:
+                body = json.loads(exc.read(2048))
+                if isinstance(body, dict) and isinstance(body.get('detail'), str):
+                    detail = body['detail'][:200].replace('\n', ' ')
+            except (ValueError, OSError, UnicodeError):
+                pass
+            log.warning('Capacidades de guía pendientes: nodo=%s HTTP=%s%s; se reintentará',
+                        node_id, exc.code, f' ({detail})' if detail else '')
             exc.close()
         except Exception as exc:
             log.warning('Capacidades de guía pendientes: nodo=%s error=%s; se reintentará',
