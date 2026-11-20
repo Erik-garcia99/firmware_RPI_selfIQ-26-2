@@ -38,6 +38,15 @@ REQUEST = 'selfiq/esp32_setup'
 NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
 NODE_TYPE_ALIASES = {'shelf_guide': 'guide', 'occupancy': 'access_counter', 'camera': 'shelf_cam'}
 
+GUIDE_MODULE = 'shelf_monitor'
+GUIDE_BOOT_RE = re.compile(r'^[0-9a-f]{8}$')
+GUIDE_APPLIED = {'on', 'off', 'rejected', 'error'}
+GUIDE_REASONS = {'ok', 'stale', 'wrong_boot', 'bad_channel', 'malformed',
+                 'duplicate', 'gpio_error', 'ttl', 'busy'}
+GUIDE_MAX_WAIT_SECONDS = 65
+GUIDE_STATUS_WAIT_SECONDS = 2
+GUIDE_SAMPLE_MAX_AGE_SECONDS = 30
+
 
 class MQTTBridge:
     def __init__(self, config, backend):
@@ -63,6 +72,10 @@ class MQTTBridge:
         self.subscriptions_ready = threading.Event()
         self.subscription_mid = None
         self.default_node_type = 'guide'  # Firmware actual: shelf guide; configurar para otros tipos.
+        self._guide_waiters = {}
+        self._guide_lock = threading.Lock()
+        self._guide_samples = {}
+        self._guide_capabilities = {}
 
     def _api_url(self, suffix):
         base = urlsplit(websocket_url(self.config.backend_ws_url))
@@ -153,32 +166,328 @@ class MQTTBridge:
             self.loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._send_heartbeat(node_id)))
 
-    def test_light(self, message):
-        """Publica la prueba en el tópico de comandos del nodo (sin GPIO aún)."""
-        node_id = message.get('node_id')
-        branch_id = message.get('branch_id')
-        module = message.get('module') or 'shelf_monitor'
-        channel = message.get('channel')
-        duration_ms = message.get('duration_ms', 5000)
-        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
-                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
-                or not isinstance(module, str) or not re.fullmatch(r'[a-z0-9_]{1,32}', module)
-                or not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel < 10
-                or not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
-                or not 100 <= duration_ms <= 30000):
-            raise ValueError('Orden de prueba de luz inválida')
+    # --- Guía LED (GL-3): resultado real del nodo, nunca PUBACK ---
+    def _guide_key(self, branch_id, node_id, module=GUIDE_MODULE):
+        return f'{branch_id}/{node_id}/{module}'
+
+    def _guide_record_sample(self, branch_id, node_id, module, boot, uptime_ms):
+        """Guarda una muestra de uptime/boot del nodo, con sello monotónico local."""
+        if not (isinstance(boot, str) and GUIDE_BOOT_RE.fullmatch(boot)
+                and isinstance(uptime_ms, int) and not isinstance(uptime_ms, bool)
+                and 0 <= uptime_ms <= 2**32 - 1):
+            return False
+        with self._guide_lock:
+            self._guide_samples[self._guide_key(branch_id, node_id, module)] = {
+                'boot': boot, 'uptime_ms': uptime_ms, 'at': time.monotonic()}
+        return True
+
+    def _guide_uptime(self, branch_id, node_id, module=GUIDE_MODULE):
+        with self._guide_lock:
+            sample = self._guide_samples.get(self._guide_key(branch_id, node_id, module))
+        if not sample:
+            return None
+        age = time.monotonic() - sample['at']
+        if age < 0 or age > GUIDE_SAMPLE_MAX_AGE_SECONDS:
+            return None
+        return sample['boot'], sample['uptime_ms'] + max(0, int(age * 1000))
+
+    def _guide_publish(self, topic, payload):
         if not self.connected or self.client is None:
             raise ValueError('MQTT local no conectado')
-        topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
-        payload = json.dumps({'type': 'light.test', 'channel': channel, 'duration_ms': duration_ms})
         info = self.client.publish(topic, payload, qos=1, retain=False)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise RuntimeError(f'Publicación MQTT fallida rc={info.rc}')
         info.wait_for_publish(timeout=10)
         if not info.is_published():
             raise RuntimeError('El broker no confirmó la publicación MQTT')
-        log.info('Prueba de luz publicada en %s (canal %s)', topic, channel)
-        return {'published': True, 'channel': channel, 'duration_ms': duration_ms}
+
+    def _guide_register(self, waiter):
+        with self._guide_lock:
+            if waiter['id'] in self._guide_waiters:
+                raise ValueError('ID de guía duplicado')
+            self._guide_waiters[waiter['id']] = waiter
+
+    def _guide_finish(self, command_id):
+        with self._guide_lock:
+            return self._guide_waiters.pop(command_id, None)
+
+    def notify_guide_result(self, payload, branch_id, node_id, module):
+        """Entrega ``guide.result``/``guide.state`` solo a su espera correlacionada."""
+        if module != GUIDE_MODULE or not isinstance(payload, dict):
+            return False
+        kind = payload.get('t')
+        if kind not in ('guide.result', 'guide.state'):
+            return False
+        command_id = payload.get('id')
+        if not isinstance(command_id, str) or not 8 <= len(command_id) <= 64:
+            return False
+        if not self._guide_record_sample(branch_id, node_id, module,
+                                         payload.get('boot'), payload.get('uptime_ms')):
+            log.warning('guía: resultado con boot/uptime inválido descartado')
+            return False
+        if kind == 'guide.result' and (payload.get('applied') not in GUIDE_APPLIED
+                                       or payload.get('reason') not in GUIDE_REASONS):
+            log.warning('guía: resultado con applied/reason inválido descartado')
+            return False
+        with self._guide_lock:
+            waiter = self._guide_waiters.get(command_id)
+            if waiter is None and kind == 'guide.result':
+                # light.test: el firmware genera su propio id, se correlaciona
+                # por canal mientras haya una sola prueba activa en ese canal.
+                for candidate in self._guide_waiters.values():
+                    if (candidate['kind'] == 'test'
+                            and candidate['channel'] == payload.get('ch')):
+                        waiter = candidate
+                        break
+        if not waiter or waiter['branch_id'] != branch_id or waiter['node_id'] != node_id:
+            log.warning('guía: resultado ajeno o sin espera descartado')
+            return False
+        if waiter['kind'] == 'test':
+            # El firmware genera su propio id para light.test: se correlaciona
+            # por canal, con una sola espera activa por canal.
+            if kind != 'guide.result' or payload.get('ch') != waiter['channel']:
+                return False
+        else:
+            if kind != waiter['expect']:
+                return False
+            if waiter.get('session') and payload.get('session') != waiter['session']:
+                log.warning('guía: resultado de otra sesión descartado')
+                return False
+            if kind == 'guide.result' and payload.get('ch') != waiter['channel']:
+                return False
+        waiter['result'] = payload
+        waiter['event'].set()
+        return True
+
+    def _guide_request_state(self, branch_id, node_id, module=GUIDE_MODULE):
+        """Consulta ``guide.status`` para obtener un uptime medido, no inventado."""
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo para consultar el estado de la guía')
+        command_id = f'gs-{secrets.token_hex(8)}'
+        waiter = {'id': command_id, 'kind': 'status', 'expect': 'guide.state',
+                  'event': threading.Event(), 'result': None,
+                  'branch_id': branch_id, 'node_id': node_id, 'session': None,
+                  'channel': None}
+        self._guide_register(waiter)
+        try:
+            topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+            payload = json.dumps({'v': 1, 't': 'guide.status', 'id': command_id},
+                                 separators=(',', ':'))
+            self._guide_publish(topic, payload)
+            if not waiter['event'].wait(GUIDE_STATUS_WAIT_SECONDS):
+                return None
+            return waiter['result']
+        finally:
+            self._guide_finish(command_id)
+
+    def _guide_deadline(self, branch_id, node_id):
+        sample = self._guide_uptime(branch_id, node_id)
+        if sample is None:
+            state = self._guide_request_state(branch_id, node_id)
+            if not state:
+                raise ValueError('guide_node_unavailable')
+            sample = self._guide_uptime(branch_id, node_id)
+            if sample is None:
+                raise ValueError('guide_node_unavailable')
+        return sample
+
+    def _guide_outcome(self, payload, channel, session, boot):
+        if payload is None:
+            return {'delivery': 'unknown', 'light': 'unknown', 'channel': channel,
+                    'session_id': session, 'node_boot': boot, 'reason': 'node_timeout'}
+        applied = payload.get('applied')
+        if applied in ('on', 'off'):
+            delivery, light = 'applied', applied
+        elif applied == 'rejected':
+            delivery, light = 'rejected', 'unknown'
+        else:
+            delivery, light = 'error', 'unknown'
+        result = {'delivery': delivery, 'light': light, 'channel': channel,
+                  'session_id': session, 'node_boot': boot}
+        if delivery != 'applied' and payload.get('reason') in GUIDE_REASONS:
+            result['reason'] = payload['reason']
+        return result
+
+    def _guide_command(self, message, action):
+        node_id, branch_id = message.get('node_id'), message.get('branch_id')
+        module = message.get('module') or GUIDE_MODULE
+        session = message.get('session_id')
+        channel = message.get('channel')
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or module != GUIDE_MODULE
+                or not isinstance(session, str) or not UUID_RE.fullmatch(session)
+                or not isinstance(channel, int) or isinstance(channel, bool)
+                or not 0 <= channel < 10):
+            raise ValueError('Orden de guía inválida')
+        caps = self._guide_capabilities.get(node_id)
+        if caps and channel >= caps['channels']:
+            raise ValueError('invalid_channel')
+        ttl_ms = message.get('ttl_ms', 60000)
+        accept_window_ms = message.get('accept_window_ms', 3000)
+        if (not isinstance(ttl_ms, int) or isinstance(ttl_ms, bool) or not 1000 <= ttl_ms <= 60000
+                or not isinstance(accept_window_ms, int) or isinstance(accept_window_ms, bool)
+                or not 0 <= accept_window_ms <= 3000):
+            raise ValueError('Plazo de guía inválido')
+        boot, uptime = self._guide_deadline(branch_id, node_id)
+        accept_ms = uptime + accept_window_ms
+        command_id = f'gd-{secrets.token_hex(8)}'
+        wire = {'v': 1, 't': action, 'id': command_id, 'session': session,
+                'ch': channel, 'boot': boot, 'accept_ms': accept_ms}
+        if action == 'guide.start':
+            wire['end_ms'] = accept_ms + ttl_ms
+        waiter = {'id': command_id, 'kind': 'start', 'expect': 'guide.result',
+                  'event': threading.Event(), 'result': None, 'unknown': False,
+                  'branch_id': branch_id, 'node_id': node_id, 'session': session,
+                  'channel': channel}
+        self._guide_register(waiter)
+        started = time.monotonic()
+        try:
+            topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+            self._guide_publish(topic, json.dumps(wire, separators=(',', ':')))
+            log.info('Guía %s publicada: nodo=%s ch=%s id=%s', action, node_id, channel, command_id)
+            if waiter.get('unknown') or not waiter['event'].wait(GUIDE_MAX_WAIT_SECONDS):
+                log.warning('Guía %s sin resultado: id=%s', action, command_id)
+                return self._guide_outcome(None, channel, session, boot)
+            return self._guide_outcome(waiter['result'], channel, session, boot)
+        finally:
+            self._guide_finish(command_id)
+
+    def guide_start(self, message):
+        return self._guide_command(message or {}, 'guide.start')
+
+    def guide_stop(self, message):
+        return self._guide_command(message or {}, 'guide.stop')
+
+    def guide_status(self, message):
+        message = message or {}
+        node_id, branch_id = message.get('node_id'), message.get('branch_id')
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)):
+            raise ValueError('Identidad del nodo inválida')
+        state = self._guide_request_state(branch_id, node_id)
+        if not state:
+            return {'delivery': 'unknown', 'reason': 'node_timeout'}
+        return {'delivery': 'applied', 'boot': state.get('boot'),
+                'uptime_ms': state.get('uptime_ms'), 'on': state.get('on'),
+                'last_ch': state.get('last_ch'), 'last': state.get('last')}
+
+    def test_light(self, message):
+        """Prueba staff: espera el ``guide.result`` del nodo, no el PUBACK."""
+        node_id = message.get('node_id')
+        branch_id = message.get('branch_id')
+        module = message.get('module') or GUIDE_MODULE
+        channel = message.get('channel')
+        duration_ms = message.get('duration_ms', 5000)
+        if (not isinstance(node_id, str) or not UUID_RE.fullmatch(node_id)
+                or not isinstance(branch_id, str) or not UUID_RE.fullmatch(branch_id)
+                or module != GUIDE_MODULE
+                or not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel < 10
+                or not isinstance(duration_ms, int) or isinstance(duration_ms, bool)
+                or not 100 <= duration_ms <= 30000):
+            raise ValueError('Orden de prueba de luz inválida')
+        caps = self._guide_capabilities.get(node_id)
+        if caps and channel >= caps['channels']:
+            raise ValueError('invalid_channel')
+        if not self.connected or not self.subscriptions_ready.wait(5):
+            raise ValueError('MQTT no está listo para probar la luz')
+        session = '00000000-0000-4000-8000-' + secrets.token_hex(6)
+        waiter = {'id': 'lt-' + secrets.token_hex(8), 'kind': 'test',
+                  'event': threading.Event(), 'result': None, 'unknown': False,
+                  'branch_id': branch_id, 'node_id': node_id, 'session': None,
+                  'channel': channel}
+        with self._guide_lock:
+            self._guide_waiters[waiter['id']] = waiter
+        try:
+            topic = f'selfiq/{branch_id}/{node_id}/{module}/command'
+            self._guide_publish(topic, json.dumps(
+                {'type': 'light.test', 'channel': channel, 'duration_ms': duration_ms},
+                separators=(',', ':')))
+            if waiter.get('unknown') or not waiter['event'].wait(GUIDE_MAX_WAIT_SECONDS):
+                return {'status': 'unknown', 'light': 'unknown', 'channel': channel,
+                        'durationSeconds': duration_ms / 1000, 'expiresInSeconds': 0}
+            applied = (waiter['result'] or {}).get('applied')
+            if applied in ('on', 'rejected', 'error'):
+                status = {'on': 'applied', 'rejected': 'rejected', 'error': 'unknown'}[applied]
+                light = 'on' if applied == 'on' else 'unknown'
+            else:
+                status, light = 'unknown', 'unknown'
+            return {'status': status, 'light': light, 'channel': channel,
+                    'durationSeconds': duration_ms / 1000,
+                    'expiresInSeconds': duration_ms / 1000}
+        finally:
+            self._guide_finish(waiter['id'])
+
+    def _validate_guide_capabilities(self, payload, branch_id):
+        if (not isinstance(payload, dict) or payload.get('v') != 1
+                or payload.get('t') != 'guide.capabilities'):
+            return None
+        boot = payload.get('boot')
+        driver = payload.get('driver')
+        channels = payload.get('channels')
+        channels_map = payload.get('channels_map')
+        if not (isinstance(boot, str) and GUIDE_BOOT_RE.fullmatch(boot)
+                and driver in ('direct', 'hc595')
+                and isinstance(channels, int) and not isinstance(channels, bool)
+                and 1 <= channels <= 8 and isinstance(channels_map, list)
+                and len(channels_map) == channels):
+            return None
+        if any(not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 255
+               for value in channels_map) or len(set(channels_map)) != channels:
+            return None
+        return {'boot': boot, 'driver': driver, 'channels': channels,
+                'channels_map': channels_map, 'fw': payload.get('fw'),
+                '_branch_id': branch_id}
+
+    def _queue_guide_capabilities(self, node_id, caps):
+        if self.loop is None:
+            return
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(
+            asyncio.to_thread(self._post_guide_capabilities, node_id, caps)))
+
+    def _post_guide_capabilities(self, node_id, caps):
+        """Reenvía capacidades firmadas; 404 mientras el backend no lo exponga (GL-4)."""
+        if not self.backend.connected:
+            return
+        try:
+            identity = self.backend.ensure_identity()
+            timestamp = int(time.time())
+            nonce = secrets.token_urlsafe(18)
+            map_csv = ','.join(str(value) for value in caps['channels_map'])
+            data = (f'selfiq-guide-capabilities-v1\n{self.config.gateway_id}\n{timestamp}\n'
+                    f'{nonce}\n{node_id}\n{caps["boot"]}\n{caps["driver"]}\n'
+                    f'{caps["channels"]}\n{map_csv}').encode()
+            payload = {'timestamp': timestamp, 'nonce': nonce,
+                       'signature': base64.b64encode(identity.key.sign(data)).decode(),
+                       'boot': caps['boot'], 'driver': caps['driver'],
+                       'channels': caps['channels'], 'channels_map': caps['channels_map']}
+            url = self._api_url('/nodes/' + quote(node_id, safe='') + '/guide-capabilities')
+            self._post_signed(url, payload)
+            log.info('Capacidades de guía reenviadas: nodo=%s canales=%s', node_id, caps['channels'])
+        except HTTPError as exc:
+            if exc.code == 404:
+                log.info('Backend aún no expone capacidades de guía (GL-4): nodo=%s', node_id)
+            else:
+                log.warning('No se pudieron reenviar capacidades: HTTP %s', exc.code)
+        except Exception as exc:
+            log.warning('No se pudieron reenviar capacidades: %s', type(exc).__name__)
+
+    def _clear_guide_waiters(self):
+        with self._guide_lock:
+            waiters = list(self._guide_waiters.values())
+            self._guide_waiters.clear()
+        for waiter in waiters:
+            waiter['result'] = None
+            waiter['unknown'] = True
+            waiter['event'].set()
+
+    def _request_guide_states(self):
+        """Al reconectar, recupera el último motivo de apagado de cada nodo guía."""
+        for node_id, caps in list(self._guide_capabilities.items()):
+            try:
+                self._guide_request_state(caps.get('_branch_id'), node_id)
+            except Exception:
+                log.warning('No se pudo consultar guide.state de %s al reconectar', node_id)
 
     def reset_node(self, message):
         node_id, branch_id = message.get('node_id'), message.get('branch_id')
@@ -591,6 +900,7 @@ class MQTTBridge:
             result, self.subscription_mid = client.subscribe([(REQUEST, 1), ('selfiq/+/+/+/telemetry', 1),
                                                               ('selfiq/+/+/+/status', 1),
                                                               ('selfiq/+/+/+/command/ack', 1),
+                                                              ('selfiq/+/+/+/capabilities', 1),
                                                               ('selfiq/+/+/control/result', 1)])
             if result != mqtt.MQTT_ERR_SUCCESS:
                 log.error('No se pudo solicitar suscripción MQTT: rc=%s', result)
@@ -606,6 +916,7 @@ class MQTTBridge:
         log.info('MQTT: Raspberry suscrita a %s', REQUEST)
         if mid == self.subscription_mid:
             self.subscriptions_ready.set()
+            self._request_guide_states()
 
     def _on_connect_fail(self, client, userdata):
         log.warning('MQTT: no se pudo conectar a 127.0.0.1:1883; reintentando')
@@ -613,6 +924,7 @@ class MQTTBridge:
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
         self.connected = False
         self.subscriptions_ready.clear()
+        self._clear_guide_waiters()
         log.warning('MQTT broker desconectado: %s', reason_code)
 
     def _on_message(self, client, userdata, message):
@@ -631,11 +943,37 @@ class MQTTBridge:
                 pass
             return
         if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'status':
-            if (not message.retain and message.payload == b'online'
-                    and parts[1] == (self.backend.branch_id or parts[1])
-                    and UUID_RE.fullmatch(parts[1]) and UUID_RE.fullmatch(parts[2])
-                    and re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
+            if (message.retain or len(message.payload) > 512
+                    or not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
+                    or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])
+                    or parts[1] != (self.backend.branch_id or parts[1])):
+                return
+            if message.payload == b'online':
                 self._queue_heartbeat(parts[2])
+                return
+            try:
+                payload = json.loads(message.payload)
+            except (TypeError, ValueError, UnicodeError):
+                return
+            if (isinstance(payload, dict)
+                    and self._guide_record_sample(parts[1], parts[2], parts[3],
+                                                  payload.get('boot'), payload.get('uptime_ms'))):
+                self._queue_heartbeat(parts[2])
+            return
+        if len(parts) == 5 and parts[0] == 'selfiq' and parts[4] == 'capabilities':
+            if (message.retain or len(message.payload) > 512
+                    or not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
+                    or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])
+                    or parts[1] != (self.backend.branch_id or parts[1])):
+                return
+            try:
+                payload = json.loads(message.payload)
+            except (TypeError, ValueError, UnicodeError):
+                return
+            caps = self._validate_guide_capabilities(payload, parts[1])
+            if caps:
+                self._guide_capabilities[parts[2]] = caps
+                self._queue_guide_capabilities(parts[2], caps)
             return
         if len(parts) == 6 and parts[0] == 'selfiq' and parts[4:] == ['command', 'ack']:
             if message.retain or len(message.payload) > 1024:
@@ -653,6 +991,9 @@ class MQTTBridge:
                 payload = json.loads(message.payload)
             except (TypeError, ValueError, UnicodeError):
                 log.warning('Command ACK descartado: JSON inválido')
+                return
+            if payload.get('t') in ('guide.result', 'guide.state'):
+                self.notify_guide_result(payload, parts[1], parts[2], parts[3])
                 return
             if payload.get('type') == 'cal_result':
                 self.notify_cal_result(payload, parts[1], parts[2], parts[3])
