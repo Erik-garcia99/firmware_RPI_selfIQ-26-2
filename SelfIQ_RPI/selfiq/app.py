@@ -108,7 +108,8 @@ def create_app(config, network=None):
     jobs = set()
 
     async def execute(command, message=None):
-        if command in {'snapshot.request', 'roi.set', 'light.test', 'calibrate',
+        if command in {'snapshot.request', 'roi.set', 'light.test', 'guide.start',
+                       'guide.stop', 'guide.status', 'calibrate',
                        'calibration.commit', 'calibration.cancel', 'calibration.status'}:
             body = message or {}
             if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
@@ -136,9 +137,13 @@ def create_app(config, network=None):
         if command == 'roi.set':
             return await asyncio.to_thread(mqtt_bridge.set_rois, message or {})
         if command == 'light.test':
-            # Solo se confirma la entrega al broker local; el firmware actual
-            # del nodo todavía no acciona GPIO de luces.
             return await asyncio.to_thread(mqtt_bridge.test_light, message or {})
+        if command == 'guide.start':
+            return await asyncio.to_thread(mqtt_bridge.guide_start, message or {})
+        if command == 'guide.stop':
+            return await asyncio.to_thread(mqtt_bridge.guide_stop, message or {})
+        if command == 'guide.status':
+            return await asyncio.to_thread(mqtt_bridge.guide_status, message or {})
         if command in {'calibrate', 'calibration.commit', 'calibration.cancel',
                        'calibration.status'}:
             body = (message or {}).get('data')
