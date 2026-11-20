@@ -360,7 +360,11 @@ class MQTTBridge:
             if waiter.get('unknown') or not waiter['event'].wait(GUIDE_MAX_WAIT_SECONDS):
                 log.warning('Guía %s sin resultado: id=%s', action, command_id)
                 return self._guide_outcome(None, channel, session, boot)
-            return self._guide_outcome(waiter['result'], channel, session, boot)
+            outcome = self._guide_outcome(waiter['result'], channel, session, boot)
+            log.info('Guía %s resultado: id=%s ch=%s entrega=%s luz=%s%s', action,
+                     command_id, channel, outcome['delivery'], outcome['light'],
+                     f" motivo={outcome['reason']}" if outcome.get('reason') else '')
+            return outcome
         finally:
             self._guide_finish(command_id)
 
