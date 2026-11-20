@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
-from selfiq.models import Config, Credentials
+from dataclasses import asdict
+from selfiq.models import Credentials
+from test_support import make_config as Config
 from selfiq.controller import Controller
 from selfiq.credential_integrity import read_state, write_state
 from selfiq.outbox import Outbox, StorageFull
@@ -58,11 +60,11 @@ class OfflineTests(unittest.TestCase):
         source = '''from selfiq.models import Config
 from selfiq.outbox import Outbox
 import os
-c=Config(offline_db=%r, offline_reserve_bytes=0,offline_reserve_fraction=.01)
+c=Config(**%r)
 o=Outbox(c)
 o.put(%r,%r)
 os._exit(0)
-''' % (self.c.offline_db, TOPIC, payload('crash'))
+''' % (asdict(self.c), TOPIC, payload('crash'))
         subprocess.run([sys.executable,'-c',source],check=True)
         self.assertEqual(self.store.batch()[0]['event_id'],'crash')
     def test_duplicate_and_conflict(self):
@@ -178,6 +180,7 @@ os._exit(0)
                 writer.write(bytes.fromhex('ab cd 01 11')); await writer.drain()
                 self.assertEqual(await reader.readexactly(5),bytes.fromhex('54 33 ff ff 00'))
                 ctrl.online=True
+                ctrl.pairing_until=now[0]+120
                 writer.write(bytes.fromhex('ab cd 01 41')); await writer.drain()
                 self.assertEqual((await reader.readexactly(10))[-1],2)
                 writer.close(); await writer.wait_closed()

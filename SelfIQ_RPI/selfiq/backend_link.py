@@ -43,7 +43,8 @@ class BackendLink:
         response = {'type': 'result', 'id': identifier}
         try:
             if command not in ('tcp.enable', 'tcp.disable', 'status', 'light.test',
-                               'node.reset', 'occupancy.adjust', 'snapshot.request', 'roi.set',
+                               'guide.start', 'guide.stop', 'guide.status',
+                               'node.reset', 'snapshot.request', 'roi.set',
                                'calibrate', 'calibration.commit',
                                'calibration.cancel', 'calibration.status'):
                 raise ValueError('Orden no permitida')

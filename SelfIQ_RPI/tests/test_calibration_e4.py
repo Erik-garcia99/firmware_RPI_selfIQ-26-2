@@ -191,6 +191,22 @@ class CalibrationContractTests(unittest.TestCase):
 
 
 class GatewayDispatchTests(unittest.TestCase):
+    def test_uploaded_receipts_do_not_exhaust_reference_spool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CalibrationStore(Path(tmp) / 'cal.sqlite3')
+            self.addCleanup(store.close)
+            raw = b'jpeg-test'
+            for _ in range(20):
+                cmd = command()
+                meta = {**cmd, '_node_id': cmd['node_id'],
+                        '_branch_id': cmd['branch_id'],
+                        'image_sha256': hashlib.sha256(raw).hexdigest(),
+                        'image_bytes': len(raw)}
+                state, _ = store.put_reference(meta, raw)
+                self.assertEqual(state, 'queued')
+                store.mark_reference_uploaded(meta['capture_id'])
+                self.assertEqual(store.put_reference(meta, raw)[0], 'replay')
+
     def _bridge(self, tmp):
         config = SimpleNamespace(offline_db=str(Path(tmp) / 'outbox.sqlite3'),
                                  gateway_id='gw-test', backend_ws_url='ws://localhost/ws/gateways')
