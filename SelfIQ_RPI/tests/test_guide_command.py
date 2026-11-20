@@ -1,9 +1,11 @@
 import asyncio
 import json
 import threading
+import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.error import HTTPError
 
 from selfiq.backend_link import BackendLink
 from selfiq.mqtt_bridge import MQTTBridge
@@ -33,6 +35,11 @@ def result(command_id, applied='on', reason='ok', channel=2, session=SESSION, up
     return {'v': 1, 't': 'guide.result', 'id': command_id, 'session': session,
             'ch': channel, 'boot': BOOT, 'applied': applied, 'reason': reason,
             'uptime_ms': uptime}
+
+
+def capabilities(**overrides):
+    return {'v': 1, 't': 'guide.capabilities', 'boot': BOOT, 'driver': 'direct',
+            'channels': 8, 'channels_map': [0, 1, 3, 4, 5, 6, 7, 10], **overrides}
 
 
 class GuideCommandTests(unittest.TestCase):
@@ -157,6 +164,29 @@ class GuideCommandTests(unittest.TestCase):
             self.bridge._on_message(None, None, mqtt_message(STATUS_TOPIC, b'online'))
             heartbeat.assert_called_once_with(NODE)
 
+    def test_current_firmware_capabilities_on_command_ack_are_not_roi(self):
+        with patch.object(self.bridge, 'notify_roi_ack') as roi, \
+                patch.object(self.bridge, 'notify_cal_result') as calibration, \
+                patch.object(self.bridge, '_queue_guide_capabilities') as queue:
+            self.bridge._on_message(None, None, mqtt_message(ACK_TOPIC, capabilities()))
+            self.assertEqual(self.bridge._guide_capabilities[NODE]['channels'], 8)
+            queue.assert_called_once_with(NODE, self.bridge._guide_capabilities[NODE])
+            roi.assert_not_called()
+            calibration.assert_not_called()
+
+    def test_capabilities_reject_retained_wrong_branch_camera_and_invalid_payload(self):
+        for topic in (CAPS_TOPIC, ACK_TOPIC):
+            for message in (
+                mqtt_message(topic, capabilities(), retain=True),
+                mqtt_message(topic.replace(BRANCH, SESSION), capabilities()),
+                mqtt_message(topic.replace(MODULE, 'shelf_cam'), capabilities()),
+                mqtt_message(topic, capabilities(channels_map=[1, 1])),
+                mqtt_message(topic, []),
+            ):
+                with self.subTest(topic=message.topic, retain=message.retain):
+                    self.bridge._on_message(None, None, message)
+                    self.assertFalse(self.bridge._guide_capabilities)
+
     def test_light_test_waits_for_node_result_not_puback(self):
         self.bridge.client.publish.side_effect = self.answer()
         outcome = self.bridge.test_light({'node_id': NODE, 'branch_id': BRANCH,
@@ -191,6 +221,95 @@ class WhitelistTests(unittest.IsolatedAsyncioTestCase):
         rejected = await link.process(json.dumps(
             {'type': 'command', 'id': 'cmd-other', 'command': 'guide.restart'}))
         self.assertFalse(rejected['ok'])
+
+
+class CapabilitiesUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        backend = SimpleNamespace(connected=True, branch_id=BRANCH,
+                                  ensure_identity=Mock(return_value=SimpleNamespace(
+                                      key=Mock(sign=Mock(return_value=b'signed')))))
+        config = SimpleNamespace(gateway_id='rpi-test', backend_ws_url='https://backend.example')
+        self.bridge = MQTTBridge(config, backend)
+        self.bridge.loop = asyncio.get_running_loop()
+        self.bridge._post_signed = Mock(return_value={'ok': True, 'node_id': NODE, 'channels': 8})
+
+    async def receive(self):
+        self.bridge._on_message(None, None, mqtt_message(ACK_TOPIC, capabilities()))
+        await asyncio.sleep(0)  # Ejecutar el callback encolado desde MQTT.
+
+    async def test_announcement_before_backend_connect_is_retried_without_new_announcement(self):
+        self.bridge.backend.connected = False
+        await self.receive()
+        await self.bridge._flush_guide_capabilities()
+        self.bridge._post_signed.assert_not_called()
+        self.assertIn(NODE, self.bridge._guide_capabilities_pending)
+        self.bridge.backend.connected = True
+        await self.bridge._flush_guide_capabilities()
+        url, body = self.bridge._post_signed.call_args.args
+        self.assertIn(f'/gateways/rpi-test/nodes/{NODE}/guide-capabilities', url)
+        self.assertEqual(body['channels_map'], [0, 1, 3, 4, 5, 6, 7, 10])
+        self.assertEqual(body['boot'], BOOT)
+        self.assertIn('signature', body)
+        self.assertNotIn(NODE, self.bridge._guide_capabilities_pending)
+
+    async def test_http_failure_preserves_capabilities_until_confirmed(self):
+        await self.receive()
+        self.bridge._post_signed.side_effect = [
+            HTTPError('https://backend.example', 503, 'unavailable', {}, None),
+            {'ok': True, 'node_id': NODE, 'channels': 8},
+        ]
+        await self.bridge._flush_guide_capabilities()
+        self.assertIn(NODE, self.bridge._guide_capabilities_pending)
+        self.assertNotIn(NODE, self.bridge._guide_capabilities_confirmed)
+        await self.bridge._flush_guide_capabilities()
+        self.assertFalse(self.bridge._guide_capabilities_pending)
+        self.assertIn(NODE, self.bridge._guide_capabilities_confirmed)
+
+    async def test_unconfirmed_or_foreign_response_does_not_clear_pending(self):
+        await self.receive()
+        for response in ({'ok': False}, {'ok': True, 'node_id': SESSION, 'channels': 8},
+                         {'ok': True, 'node_id': NODE, 'channels': 4}):
+            self.bridge._post_signed.return_value = response
+            await self.bridge._flush_guide_capabilities()
+            self.assertIn(NODE, self.bridge._guide_capabilities_pending)
+
+    async def test_newer_boot_received_during_http_is_not_lost(self):
+        await self.receive()
+        newer = self.bridge._validate_guide_capabilities(capabilities(boot='1234abcd'), BRANCH)
+        enqueued = asyncio.Event()
+        def post(*_args):
+            self.bridge._queue_guide_capabilities(NODE, newer)
+            self.bridge.loop.call_soon_threadsafe(enqueued.set)
+            return {'ok': True, 'node_id': NODE, 'channels': 8}
+        self.bridge._post_signed.side_effect = post
+        await self.bridge._flush_guide_capabilities()
+        await enqueued.wait()
+        self.assertIs(self.bridge._guide_capabilities_pending[NODE], newer)
+
+    async def test_heartbeat_retries_and_throttles_only_confirmed_capabilities(self):
+        await self.receive()
+        await self.bridge._flush_guide_capabilities()
+        with patch.object(self.bridge, '_send_heartbeat', new_callable=AsyncMock):
+            self.bridge._queue_heartbeat(NODE)
+            await asyncio.sleep(0)
+            self.assertFalse(self.bridge._guide_capabilities_pending)
+            caps = self.bridge._guide_capabilities[NODE]
+            self.bridge._guide_capabilities_confirmed[NODE] = (caps, time.monotonic() - 61)
+            self.bridge._queue_heartbeat(NODE)
+            await asyncio.sleep(0)
+            self.assertIn(NODE, self.bridge._guide_capabilities_pending)
+
+    async def test_worker_is_stopped_with_bridge(self):
+        flushed = asyncio.Event()
+        async def flush():
+            flushed.set()
+        self.bridge._flush_guide_capabilities = flush
+        worker = asyncio.create_task(self.bridge._guide_capability_uploads())
+        self.bridge._guide_capabilities_worker = worker
+        await flushed.wait()
+        await self.bridge.stop()
+        self.assertTrue(worker.cancelled())
+        self.assertIsNone(self.bridge._guide_capabilities_worker)
 
 
 if __name__ == '__main__':

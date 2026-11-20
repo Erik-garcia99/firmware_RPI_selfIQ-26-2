@@ -76,6 +76,10 @@ class MQTTBridge:
         self._guide_lock = threading.Lock()
         self._guide_samples = {}
         self._guide_capabilities = {}
+        self._guide_capabilities_pending = {}
+        self._guide_capabilities_confirmed = {}
+        self._guide_capabilities_wake = asyncio.Event()
+        self._guide_capabilities_worker = None
 
     def _api_url(self, suffix):
         base = urlsplit(websocket_url(self.config.backend_ws_url))
@@ -165,6 +169,9 @@ class MQTTBridge:
         if self.loop is not None:
             self.loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(self._send_heartbeat(node_id)))
+            caps = self._guide_capabilities.get(node_id)
+            if caps:
+                self._queue_guide_capabilities(node_id, caps)
 
     # --- Guía LED (GL-3): resultado real del nodo, nunca PUBACK ---
     def _guide_key(self, branch_id, node_id, module=GUIDE_MODULE):
@@ -442,13 +449,51 @@ class MQTTBridge:
     def _queue_guide_capabilities(self, node_id, caps):
         if self.loop is None:
             return
-        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(
-            asyncio.to_thread(self._post_guide_capabilities, node_id, caps)))
+        def enqueue():
+            confirmed = self._guide_capabilities_confirmed.get(node_id)
+            if confirmed and confirmed[0] == caps and time.monotonic() - confirmed[1] < 60:
+                return
+            self._guide_capabilities_pending[node_id] = caps
+            self._guide_capabilities_wake.set()
+        self.loop.call_soon_threadsafe(enqueue)
 
-    def _post_guide_capabilities(self, node_id, caps):
-        """Reenvía capacidades firmadas; 404 mientras el backend no lo exponga (GL-4)."""
+    def _receive_guide_capabilities(self, payload, branch_id, node_id, module):
+        # El módulo de cámara no declara ni configura canales LED.
+        if module != GUIDE_MODULE:
+            return
+        caps = self._validate_guide_capabilities(payload, branch_id)
+        if not caps:
+            log.warning('Capacidades de guía inválidas: nodo=%s', node_id)
+            return
+        if self._guide_capabilities.get(node_id) != caps:
+            log.info('Capacidades de guía recibidas: nodo=%s canales=%s driver=%s',
+                     node_id, caps['channels'], caps['driver'])
+        self._guide_capabilities[node_id] = caps
+        self._queue_guide_capabilities(node_id, caps)
+
+    async def _flush_guide_capabilities(self):
         if not self.backend.connected:
             return
+        for node_id, caps in list(self._guide_capabilities_pending.items()):
+            if await asyncio.to_thread(self._post_guide_capabilities, node_id, caps):
+                self._guide_capabilities_confirmed[node_id] = (caps, time.monotonic())
+                # No descartar un anuncio nuevo recibido durante el HTTP.
+                if self._guide_capabilities_pending.get(node_id) is caps:
+                    self._guide_capabilities_pending.pop(node_id, None)
+
+    async def _guide_capability_uploads(self):
+        while True:
+            self._guide_capabilities_wake.clear()
+            await self._flush_guide_capabilities()
+            try:
+                await asyncio.wait_for(self._guide_capabilities_wake.wait(), 5)
+            except asyncio.TimeoutError:
+                pass
+
+    def _post_guide_capabilities(self, node_id, caps):
+        """Registra metadatos del nodo; nunca encola órdenes de encendido."""
+        if not self.backend.connected or caps.get('_branch_id') != self.backend.branch_id:
+            return False
         try:
             identity = self.backend.ensure_identity()
             timestamp = int(time.time())
@@ -462,15 +507,20 @@ class MQTTBridge:
                        'boot': caps['boot'], 'driver': caps['driver'],
                        'channels': caps['channels'], 'channels_map': caps['channels_map']}
             url = self._api_url('/nodes/' + quote(node_id, safe='') + '/guide-capabilities')
-            self._post_signed(url, payload)
+            result = self._post_signed(url, payload)
+            if (not isinstance(result, dict) or result.get('ok') is not True
+                    or result.get('node_id') != node_id or result.get('channels') != caps['channels']):
+                raise ValueError('El backend no confirmó las capacidades del nodo')
             log.info('Capacidades de guía reenviadas: nodo=%s canales=%s', node_id, caps['channels'])
+            return True
         except HTTPError as exc:
-            if exc.code == 404:
-                log.info('Backend aún no expone capacidades de guía (GL-4): nodo=%s', node_id)
-            else:
-                log.warning('No se pudieron reenviar capacidades: HTTP %s', exc.code)
+            log.warning('Capacidades de guía pendientes: nodo=%s HTTP=%s; se reintentará',
+                        node_id, exc.code)
+            exc.close()
         except Exception as exc:
-            log.warning('No se pudieron reenviar capacidades: %s', type(exc).__name__)
+            log.warning('Capacidades de guía pendientes: nodo=%s error=%s; se reintentará',
+                        node_id, type(exc).__name__)
+        return False
 
     def _clear_guide_waiters(self):
         with self._guide_lock:
@@ -970,27 +1020,32 @@ class MQTTBridge:
                 payload = json.loads(message.payload)
             except (TypeError, ValueError, UnicodeError):
                 return
-            caps = self._validate_guide_capabilities(payload, parts[1])
-            if caps:
-                self._guide_capabilities[parts[2]] = caps
-                self._queue_guide_capabilities(parts[2], caps)
+            self._receive_guide_capabilities(payload, parts[1], parts[2], parts[3])
             return
         if len(parts) == 6 and parts[0] == 'selfiq' and parts[4:] == ['command', 'ack']:
             if message.retain or len(message.payload) > 1024:
-                log.warning('ROI ACK descartado: retained o demasiado grande')
+                log.warning('Command ACK descartado: retained o demasiado grande')
                 return
             if (not UUID_RE.fullmatch(parts[1]) or not UUID_RE.fullmatch(parts[2])
                     or not re.fullmatch(r'[a-z0-9_]{1,32}', parts[3])):
-                log.warning('ROI ACK descartado: tópico inválido')
+                log.warning('Command ACK descartado: tópico inválido')
                 return
             expected_branch = getattr(self.backend, 'branch_id', None)
             if expected_branch and parts[1] != expected_branch:
-                log.warning('ROI ACK descartado: sucursal distinta')
+                log.warning('Command ACK descartado: sucursal distinta')
                 return
             try:
                 payload = json.loads(message.payload)
             except (TypeError, ValueError, UnicodeError):
                 log.warning('Command ACK descartado: JSON inválido')
+                return
+            if not isinstance(payload, dict):
+                return
+            if payload.get('t') == 'guide.capabilities':
+                # El firmware guía actual usa su publicador compartido
+                # command/ack para este anuncio. No es un resultado ROI.
+                if len(message.payload) <= 512:
+                    self._receive_guide_capabilities(payload, parts[1], parts[2], parts[3])
                 return
             if payload.get('t') in ('guide.result', 'guide.state'):
                 self.notify_guide_result(payload, parts[1], parts[2], parts[3])
@@ -1116,8 +1171,14 @@ class MQTTBridge:
         self._ensure_cal_store()
         self._calibration_worker = asyncio.create_task(
             self._calibration_uploads(), name='selfiq-calibration-uploads')
+        self._guide_capabilities_worker = asyncio.create_task(
+            self._guide_capability_uploads(), name='selfiq-guide-capabilities')
 
     async def stop(self):
+        if self._guide_capabilities_worker:
+            self._guide_capabilities_worker.cancel()
+            await asyncio.gather(self._guide_capabilities_worker, return_exceptions=True)
+            self._guide_capabilities_worker = None
         if self._calibration_worker:
             self._calibration_worker.cancel()
             await asyncio.gather(self._calibration_worker, return_exceptions=True)
